@@ -1,0 +1,528 @@
+{# Fresheo product description template. Rendered into Shopify product body_html. #}
+{# Available context: meal (dict) — see src/migration/django_db.py:fetch_meals. #}
+{%- set ns = (meal.nutri_score or 'A')|upper -%}
+<div class="fresheo-product">
+
+    <!-- Nutri-Score & Rating -->
+    <div class="fresheo-nutri">
+        <span class="fresheo-nutri-label">Nutri-Score</span>
+        <div class="fresheo-nutri-badges">
+            <span class="fresheo-nutri-badge nutri-a{% if ns == 'A' %} active{% endif %}">A</span>
+            <span class="fresheo-nutri-badge nutri-b{% if ns == 'B' %} active{% endif %}">B</span>
+            <span class="fresheo-nutri-badge nutri-c{% if ns == 'C' %} active{% endif %}">C</span>
+            <span class="fresheo-nutri-badge nutri-d{% if ns == 'D' %} active{% endif %}">D</span>
+            <span class="fresheo-nutri-badge nutri-e{% if ns == 'E' %} active{% endif %}">E</span>
+        </div>
+        <div class="fresheo-rating">
+            <span class="fresheo-star">⭐</span>
+            <span class="fresheo-rating-score">{{ "%.1f"|format(meal.avg_rating|default(5.0)) }}</span>
+            <span class="fresheo-rating-count">({{ meal.rating_count|default(0) }} avis)</span>
+        </div>
+    </div>
+
+    <!-- Description -->
+    <div class="fresheo-description">
+        <h3>Description &amp; Ingrédients</h3>
+        <p>{{ meal.ingredients }}</p>
+    </div>
+
+    {% set active_diets = [] %}
+    {%- for slug, on in meal.diets.items() if on -%}
+        {%- set _ = active_diets.append(slug) -%}
+    {%- endfor %}
+    {% if active_diets %}
+    <!-- Diet Badges -->
+    <div class="fresheo-diets">
+        <h3>Convient aux régimes</h3>
+        <div class="fresheo-diet-badges">
+            {% for slug in active_diets %}
+            <span class="fresheo-diet-badge diet-{{ slug }}">{{ meal.diet_labels[slug] }}</span>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Nutrition Values -->
+    <div class="fresheo-nutrition">
+        <h3>Valeurs nutritionnelles <span class="fresheo-nutrition-portion">(par portion de {{ meal.weight|int }}g)</span></h3>
+
+        <div class="fresheo-nutrition-grid">
+            <div class="fresheo-nutrition-item">
+                <span class="fresheo-nutrition-value">{{ meal.kilo_calories|int }}</span>
+                <span class="fresheo-nutrition-unit">kcal</span>
+                <span class="fresheo-nutrition-label">Calories</span>
+            </div>
+            <div class="fresheo-nutrition-item">
+                <span class="fresheo-nutrition-value">{{ "%.2f"|format(meal.proteins|float) }}</span>
+                <span class="fresheo-nutrition-unit">g</span>
+                <span class="fresheo-nutrition-label">Protéines</span>
+            </div>
+            <div class="fresheo-nutrition-item">
+                <span class="fresheo-nutrition-value">{{ "%.2f"|format(meal.carbohydrates|float) }}</span>
+                <span class="fresheo-nutrition-unit">g</span>
+                <span class="fresheo-nutrition-label">Glucides</span>
+            </div>
+            <div class="fresheo-nutrition-item">
+                <span class="fresheo-nutrition-value">{{ "%.2f"|format(meal.lipids|float) }}</span>
+                <span class="fresheo-nutrition-unit">g</span>
+                <span class="fresheo-nutrition-label">Lipides</span>
+            </div>
+        </div>
+
+        <div class="fresheo-nutrition-details">
+            <div class="fresheo-nutrition-detail">
+                <div class="fresheo-nutrition-detail-label">Sucres</div>
+                <div class="fresheo-nutrition-detail-value">{{ "%.2f"|format(meal.sugars|float) }}g</div>
+            </div>
+            <div class="fresheo-nutrition-detail">
+                <div class="fresheo-nutrition-detail-label">Graisses saturées</div>
+                <div class="fresheo-nutrition-detail-value">{{ "%.2f"|format(meal.saturated|float) }}g</div>
+            </div>
+            <div class="fresheo-nutrition-detail">
+                <div class="fresheo-nutrition-detail-label">Fibres</div>
+                <div class="fresheo-nutrition-detail-value">{{ "%.2f"|format(meal.fibers|float) }}g</div>
+            </div>
+            <div class="fresheo-nutrition-detail">
+                <div class="fresheo-nutrition-detail-label">Sel</div>
+                <div class="fresheo-nutrition-detail-value">{{ "%.2f"|format(meal.salts|float) }}g</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Allergens -->
+    <div class="fresheo-allergens">
+        <h3>Allergènes</h3>
+        <p>{% if meal.allergens %}{{ meal.allergens }}{% else %}Allergènes : aucun allergène majeur.{% endif %}</p>
+    </div>
+
+</div>
+<style>
+.fresheo-product {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+    color: #2d3436;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px 0;
+}
+
+/* Nutri-Score */
+.fresheo-nutri {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    margin-bottom: 20px;
+    padding: 15px;
+    background: #f8f9fa;
+    border-radius: 10px;
+}
+
+.fresheo-nutri-label {
+    font-size: 14px;
+    font-weight: 600;
+    color: #636e72;
+}
+
+.fresheo-nutri-badges {
+    display: flex;
+    gap: 4px;
+}
+
+.fresheo-nutri-badge {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 700;
+    color: white;
+    opacity: 0.35;
+    filter: grayscale(0.7);
+    transition: transform 0.2s ease, opacity 0.2s ease, filter 0.2s ease;
+}
+
+.fresheo-nutri-badge.active {
+    opacity: 1;
+    filter: none;
+    transform: scale(1.4);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.28);
+    border: 2px solid #fff;
+    z-index: 1;
+}
+
+.nutri-a { background: #038141; }
+.nutri-b { background: #85bb2f; }
+.nutri-c { background: #fecb02; color: #2d3436; }
+.nutri-d { background: #ee8100; }
+.nutri-e { background: #e63e11; }
+
+.fresheo-rating {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.fresheo-star {
+    color: #FDB913;
+    font-size: 16px;
+}
+
+.fresheo-rating-score {
+    font-size: 18px;
+    font-weight: 700;
+    color: #2d3436;
+}
+
+.fresheo-rating-count {
+    font-size: 14px;
+    color: #636e72;
+}
+
+/* Description */
+.fresheo-description {
+    margin-bottom: 25px;
+    background: white;
+    border: 1px solid #e9ecef;
+    border-radius: 10px;
+    padding: 20px;
+}
+
+.fresheo-description h3 {
+    font-size: 16px;
+    font-weight: 700;
+    color: #2d3436;
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid #f0f9e8;
+}
+
+.fresheo-description p {
+    font-size: 15px;
+    color: #636e72;
+    line-height: 1.6;
+}
+
+/* Diet Badges */
+.fresheo-diets {
+    margin-bottom: 25px;
+    background: white;
+    border: 1px solid #e9ecef;
+    border-radius: 10px;
+    padding: 20px;
+}
+
+.fresheo-diets h3 {
+    font-size: 16px;
+    font-weight: 700;
+    color: #2d3436;
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid #f0f9e8;
+}
+
+.fresheo-diet-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.fresheo-diet-badge {
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    /* Neutral fallback so unknown diet-* classes still render as a pill. */
+    background: #eef1f4;
+    color: #4a5568;
+}
+
+.diet-vegetarien {
+    background: #d4f4dd;
+    color: #27ae60;
+}
+
+.diet-vegan {
+    background: #c8e6c9;
+    color: #2e7d32;
+}
+
+.diet-sans-gluten {
+    background: #dae8fc;
+    color: #2e75b6;
+}
+
+.diet-sans-lactose {
+    background: #fff4e6;
+    color: #e67e22;
+}
+
+.diet-sans-porc {
+    background: #ffe9e9;
+    color: #e74c3c;
+}
+
+.diet-meat {
+    background: #fde0d4;
+    color: #b03a2e;
+}
+
+.diet-fish {
+    background: #d6eaf8;
+    color: #1f6a99;
+}
+
+.diet-fitness {
+    background: #ede1f5;
+    color: #6a1b9a;
+}
+
+/* Nutrition Values */
+.fresheo-nutrition {
+    margin-bottom: 25px;
+    background: white;
+    border: 1px solid #e9ecef;
+    border-radius: 10px;
+    padding: 20px;
+}
+
+.fresheo-nutrition h3 {
+    font-size: 16px;
+    font-weight: 700;
+    color: #2d3436;
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid #f0f9e8;
+    display: flex;
+    align-items: center;
+}
+
+.fresheo-nutrition-portion {
+    font-size: 13px;
+    color: #636e72;
+    font-weight: 400;
+    margin-left: auto;
+}
+
+.fresheo-nutrition-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 15px;
+    margin-bottom: 15px;
+}
+
+.fresheo-nutrition-item {
+    text-align: center;
+    padding: 15px;
+    background: #f8f9fa;
+    border-radius: 8px;
+}
+
+.fresheo-nutrition-value {
+    font-size: 24px;
+    font-weight: 700;
+    color: #9ABE36;
+    display: block;
+    margin-bottom: 4px;
+}
+
+.fresheo-nutrition-unit {
+    font-size: 12px;
+    font-weight: 600;
+    color: #636e72;
+    display: block;
+    margin-bottom: 4px;
+}
+
+.fresheo-nutrition-label {
+    font-size: 13px;
+    color: #2d3436;
+    font-weight: 600;
+}
+
+.fresheo-nutrition-details {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+}
+
+.fresheo-nutrition-detail {
+    text-align: center;
+    padding: 10px;
+    background: white;
+    border: 1px solid #e9ecef;
+    border-radius: 6px;
+}
+
+.fresheo-nutrition-detail-label {
+    font-size: 11px;
+    color: #636e72;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+
+.fresheo-nutrition-detail-value {
+    font-size: 16px;
+    font-weight: 700;
+    color: #2d3436;
+}
+
+/* Allergens */
+.fresheo-allergens {
+    background: white;
+    border: 1px solid #e9ecef;
+    border-left: 4px solid #e74c3c;
+    padding: 20px;
+    border-radius: 10px;
+}
+
+.fresheo-allergens h3 {
+    font-size: 14px;
+    font-weight: 700;
+    color: #e74c3c;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.fresheo-allergens p {
+    font-size: 14px;
+    color: #2d3436;
+    margin: 0;
+}
+
+/* Mobile */
+@media (max-width: 600px) {
+    .fresheo-product {
+        padding: 15px 10px;
+    }
+
+    .fresheo-nutri {
+        flex-wrap: wrap;
+        padding: 12px;
+        gap: 10px;
+    }
+
+    .fresheo-nutri-label {
+        font-size: 12px;
+    }
+
+    .fresheo-nutri-badge {
+        width: 24px;
+        height: 24px;
+        font-size: 11px;
+    }
+
+    .fresheo-nutri-badge.active {
+        transform: scale(1.3);
+        border-width: 1.5px;
+    }
+
+    .fresheo-rating {
+        margin-left: 0;
+        width: 100%;
+        justify-content: center;
+    }
+
+    .fresheo-star {
+        font-size: 14px;
+    }
+
+    .fresheo-rating-score {
+        font-size: 16px;
+    }
+
+    .fresheo-rating-count {
+        font-size: 12px;
+    }
+
+    .fresheo-description,
+    .fresheo-diets,
+    .fresheo-nutrition {
+        margin-bottom: 20px;
+    }
+
+    .fresheo-description h3,
+    .fresheo-diets h3,
+    .fresheo-nutrition h3 {
+        font-size: 14px;
+        margin-bottom: 8px;
+    }
+
+    .fresheo-description p {
+        font-size: 13px;
+    }
+
+    .fresheo-diet-badges {
+        gap: 6px;
+    }
+
+    .fresheo-diet-badge {
+        padding: 6px 12px;
+        font-size: 11px;
+    }
+
+    .fresheo-nutrition-portion {
+        font-size: 11px;
+        display: block;
+        margin-left: 0;
+        margin-top: 4px;
+    }
+
+    .fresheo-nutrition-grid {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 10px;
+        margin-bottom: 12px;
+    }
+
+    .fresheo-nutrition-item {
+        padding: 12px 8px;
+    }
+
+    .fresheo-nutrition-value {
+        font-size: 20px;
+    }
+
+    .fresheo-nutrition-unit {
+        font-size: 11px;
+    }
+
+    .fresheo-nutrition-label {
+        font-size: 12px;
+    }
+
+    .fresheo-nutrition-details {
+        grid-template-columns: repeat(2, 1fr);
+        gap: 8px;
+    }
+
+    .fresheo-nutrition-detail {
+        padding: 8px 6px;
+    }
+
+    .fresheo-nutrition-detail-label {
+        font-size: 10px;
+    }
+
+    .fresheo-nutrition-detail-value {
+        font-size: 14px;
+    }
+
+    .fresheo-allergens {
+        padding: 12px 15px;
+    }
+
+    .fresheo-allergens h3 {
+        font-size: 13px;
+        margin-bottom: 6px;
+    }
+
+    .fresheo-allergens p {
+        font-size: 12px;
+    }
+}
+</style>
