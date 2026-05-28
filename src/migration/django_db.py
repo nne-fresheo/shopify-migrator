@@ -126,6 +126,35 @@ def category_label_fr(category: Optional[str]) -> str:
     return _CATEGORY_LABELS_FR.get(category, "")
 
 
+# Maps each Meal.category to a Shopify Standard Product Taxonomy node. This —
+# NOT the free-text product_type — is what Shopify Tax reads to apply the
+# Belgian VAT rate: food nodes resolve to 6%, and categories left unmapped fall
+# back to the 21% standard rate. Confirmed with the user on 2026-05-25:
+#   MAIN_DISH/BREAKFAST → Prepared Meals & Entrées, DESSERT → Prepared Desserts
+#   & Sweets, SNACK → Snack Foods, DRINKS → Beverages (all 6%).
+#   VACUUM ("Fresheo deals", undefined) and NON_FOOD are intentionally absent →
+#   standard 21%.
+# Values are bare taxonomy IDs; `category_taxonomy_gid` wraps them into the GID
+# the GraphQL `category` field expects. The resulting rate must still be
+# verified per category with a draft order — Shopify Tax's reduced-rate coverage
+# is not uniform across nodes.
+_CATEGORY_TAXONOMY = {
+    "MAIN_DISH": "fb-2-15-2",   # Prepared Meals & Entrées
+    "BREAKFAST": "fb-2-15-2",   # Prepared Meals & Entrées
+    "DESSERT":   "fb-2-15-3",   # Prepared Desserts & Sweets
+    "SNACK":     "fb-2-17",     # Snack Foods
+    "DRINKS":    "fb-1",        # Beverages (non-alcoholic catalogue)
+}
+
+
+def category_taxonomy_gid(category: Optional[str]) -> Optional[str]:
+    """Return the Shopify taxonomy category GID for a Meal.category, or None
+    when the category is unmapped (VACUUM, NON_FOOD, unknown) — None means
+    'leave uncategorized', which yields the 21% standard VAT rate."""
+    node = _CATEGORY_TAXONOMY.get(category or "")
+    return f"gid://shopify/TaxonomyCategory/{node}" if node else None
+
+
 _DIET_LABELS_FR = {
     "vegetarien":   "🥗 Végétarien",
     "vegan":        "🌱 Vegan",
@@ -235,11 +264,6 @@ def _plan_label(name: Optional[str]) -> str:
     return _PLAN_LABEL_ALIASES.get(cleaned.lower(), cleaned.title())
 
 
-def _plan_slug(label: str) -> str:
-    """SKU-safe slug of a plan label: `Standard` → `standard`, `XL Plan` → `xl-plan`."""
-    return re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
-
-
 def _build_variants(
     *,
     meal_id: int,
@@ -253,18 +277,22 @@ def _build_variants(
     For [[_SIZED_CATEGORIES]] (MAIN_DISH, BREAKFAST), emits one variant per
     plan row. Per-variant price = additional_meal_price + unit_price +
     extra_price. Each variant carries option1=<plan label> and a deterministic
-    SKU `fresheo-{meal_id}-{plan-slug}` so admin filters resolve to the same
-    SKU on every re-sync.
+    SKU `fresheo-{meal_id}-{plan_id}` so admin filters resolve to the same
+    SKU on every re-sync, even if a plan is renamed.
 
     For other categories, emits a single variant priced from unit_price +
     extra_price with no option1 and SKU `fresheo-{meal_id}`.
     """
     base_extras = float(unit_price or 0) + float(extra_price or 0)
 
-    # `inventory_management=None` disables Shopify stock tracking on every
-    # variant — meals are made-to-order, not warehoused. Without this, adding
-    # a fresh variant inherits the store-level default which can be 'shopify'
-    # (tracked) and surfaces an out-of-stock state on first sync.
+    # Stock tracking is deliberately NOT set on these REST variant payloads.
+    # Shopify removed the `inventory_management` field from the REST Admin API
+    # in version 2024-04, so sending it is a silent no-op on the version this
+    # store runs — the variant just inherits the store-level default (usually
+    # tracked) and surfaces a false out-of-stock state. Meals are made-to-order:
+    # MealsResource disables tracking per variant via a GraphQL
+    # productVariantsBulkUpdate (inventoryItem.tracked=false) right after the
+    # product is created or its variants are replaced.
     if category in _SIZED_CATEGORIES and plans:
         variants: list[dict] = []
         for plan in plans:
@@ -273,15 +301,13 @@ def _build_variants(
             variants.append({
                 "price": _format_price(price),
                 "option1": label,
-                "sku": f"fresheo-{meal_id}-{_plan_slug(label)}",
-                "inventory_management": None,
+                "sku": f"fresheo-{meal_id}-{plan['plan_id']}",
             })
         return variants
 
     return [{
         "price": _format_price(base_extras),
         "sku": f"fresheo-{meal_id}",
-        "inventory_management": None,
     }]
 
 
@@ -398,6 +424,7 @@ async def fetch_meals(
             "unit_price":    variants[0]["price"],
             "category":      category,
             "category_label": category_label_fr(category),
+            "category_gid":  category_taxonomy_gid(category),
             "is_active_today": is_active_today,
             "tags": _build_tags(
                 diets=diets,

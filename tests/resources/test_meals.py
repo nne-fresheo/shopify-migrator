@@ -17,6 +17,7 @@ from migration.django_db import (
     _plan_label,
     _resolve_image_urls,
     category_label_fr,
+    category_taxonomy_gid,
 )
 from migration.id_map import IDMap
 from migration.resources.meals import (
@@ -26,10 +27,12 @@ from migration.resources.meals import (
     _diff_publications,
     _escape_for_query,
     _needs_subscription_association,
+    _needs_tracking_disable,
     _parse_image_sources,
     _parse_tags_csv,
     _serialize_image_sources,
     _slugify,
+    _variants_differ,
 )
 from migration.template import DescriptionRenderer
 
@@ -75,14 +78,13 @@ def sample_meal() -> dict:
         "unit_price": "9.50",
         "category": "MAIN_DISH",
         "category_label": "Repas",
+        "category_gid": "gid://shopify/TaxonomyCategory/fb-2-15-2",
         "is_active_today": True,
         "tags": ["current-menu", "main-dish", "meat", "nutri-a", "sans-gluten"],
         "options": [{"name": "Size", "values": ["Standard", "Large"]}],
         "variants": [
-            {"price": "9.50",  "option1": "Standard", "sku": "fresheo-42-standard",
-             "inventory_management": None},
-            {"price": "11.50", "option1": "Large",    "sku": "fresheo-42-large",
-             "inventory_management": None},
+            {"price": "9.50",  "option1": "Standard", "sku": "fresheo-42-1"},
+            {"price": "11.50", "option1": "Large",    "sku": "fresheo-42-2"},
         ],
     }
 
@@ -107,6 +109,7 @@ def _existing_node(
     image_sources: list[str] | None = None,
     publications: dict[str, bool] | None = None,
     selling_plan_group_ids: list[str] | None = None,
+    category_gid: str | None = None,
 ) -> dict:
     """Build a Shopify-shaped product node for `getProductById` / `findByTitle`
     responses. If `payload` is given, fields default to values that produce
@@ -164,6 +167,7 @@ def _existing_node(
         "bodyHtml": final_body,
         "tags": list(final_tags),
         "productType": final_pt,
+        "category": {"id": category_gid} if category_gid else None,
         "options": [
             {"id": f"gid://{i}", "name": o["name"], "position": i+1,
              "values": list(o.get("values") or [])}
@@ -224,6 +228,17 @@ def _smart_graphql(
         if "sellingPlanGroupAddProducts" in query:
             return {"sellingPlanGroupAddProducts": {
                 "sellingPlanGroup": {"id": variables.get("id")},
+                "userErrors": [],
+            }}
+        if "disableTracking" in query or "productVariantsBulkUpdate" in query:
+            return {"productVariantsBulkUpdate": {"userErrors": []}}
+        if "setCategory" in query or "productUpdate" in query:
+            product = (variables or {}).get("product", {})
+            return {"productUpdate": {
+                "product": {
+                    "id": product.get("id"),
+                    "category": {"id": product.get("category")},
+                },
                 "userErrors": [],
             }}
         if "getProductById" in query:
@@ -457,10 +472,8 @@ class TestBuildVariants:
             unit_price=4, extra_price=0.5, plans=self._plans(),
         )
         assert variants == [
-            {"price": "9.50",  "option1": "Standard", "sku": "fresheo-42-standard",
-             "inventory_management": None},
-            {"price": "11.50", "option1": "Large",    "sku": "fresheo-42-large",
-             "inventory_management": None},
+            {"price": "9.50",  "option1": "Standard", "sku": "fresheo-42-1"},
+            {"price": "11.50", "option1": "Large",    "sku": "fresheo-42-2"},
         ]
 
     def test_breakfast_two_variants(self):
@@ -478,7 +491,7 @@ class TestBuildVariants:
             unit_price=2.5, extra_price=0, plans=self._plans(),
         )
         assert variants == [
-            {"price": "2.50", "sku": "fresheo-12", "inventory_management": None},
+            {"price": "2.50", "sku": "fresheo-12"},
         ]
 
     def test_snack_single_variant(self):
@@ -487,7 +500,7 @@ class TestBuildVariants:
             unit_price=1.99, extra_price=0.01, plans=self._plans(),
         )
         assert variants == [
-            {"price": "2.00", "sku": "fresheo-99", "inventory_management": None},
+            {"price": "2.00", "sku": "fresheo-99"},
         ]
 
     def test_non_food_single_variant(self):
@@ -496,12 +509,14 @@ class TestBuildVariants:
             unit_price=10, extra_price=0, plans=self._plans(),
         )
         assert variants == [
-            {"price": "10.00", "sku": "fresheo-100", "inventory_management": None},
+            {"price": "10.00", "sku": "fresheo-100"},
         ]
 
-    def test_inventory_tracking_disabled_on_all_variants(self):
-        # Every variant must opt out of Shopify's stock tracking — meals are
-        # made-to-order, so an out-of-stock state would block the storefront.
+    def test_variants_carry_no_rest_inventory_field(self):
+        # The REST `inventory_management` field was removed in API 2024-04, so
+        # the build must NOT emit it — tracking is disabled out-of-band via a
+        # GraphQL productVariantsBulkUpdate. Emitting it would be a silent no-op
+        # and mislead readers into thinking REST controls tracking.
         main_dish = _build_variants(
             meal_id=42, category="MAIN_DISH",
             unit_price=4, extra_price=0.5, plans=self._plans(),
@@ -511,7 +526,7 @@ class TestBuildVariants:
             unit_price=2.5, extra_price=0, plans=self._plans(),
         )
         for v in main_dish + drinks:
-            assert v["inventory_management"] is None
+            assert "inventory_management" not in v
 
     def test_none_prices_treated_as_zero(self):
         variants = _build_variants(
@@ -521,7 +536,8 @@ class TestBuildVariants:
         assert variants[0]["price"] == "5.00"
         assert variants[1]["price"] == "7.00"
 
-    def test_sku_slug_uses_plan_label(self):
+    def test_sku_uses_plan_id(self):
+        # SKU keys on plan_id so renaming a plan label doesn't shift SKUs.
         plans = [
             {"plan_id": 5, "plan_label": "XL Plan", "additional_meal_price": 10},
         ]
@@ -530,8 +546,7 @@ class TestBuildVariants:
             unit_price=0, extra_price=0, plans=plans,
         )
         assert variants == [
-            {"price": "10.00", "option1": "XL Plan", "sku": "fresheo-42-xl-plan",
-             "inventory_management": None},
+            {"price": "10.00", "option1": "XL Plan", "sku": "fresheo-42-5"},
         ]
 
     def test_main_dish_falls_back_to_single_when_no_plans(self):
@@ -542,7 +557,7 @@ class TestBuildVariants:
             unit_price=4, extra_price=0.5, plans=[],
         )
         assert variants == [
-            {"price": "4.50", "sku": "fresheo-7", "inventory_management": None},
+            {"price": "4.50", "sku": "fresheo-7"},
         ]
 
 
@@ -605,6 +620,40 @@ class TestCategoryLabel:
     def test_none_or_empty(self):
         assert category_label_fr(None) == ""
         assert category_label_fr("") == ""
+
+
+class TestCategoryTaxonomyGid:
+    """Maps Meal.category → Shopify taxonomy GID; this drives Belgian VAT.
+    Food categories → 6% food nodes; unmapped → None (uncategorized = 21%)."""
+
+    def test_food_categories_map_to_prepared_food_nodes(self):
+        assert category_taxonomy_gid("MAIN_DISH") == (
+            "gid://shopify/TaxonomyCategory/fb-2-15-2"
+        )
+        assert category_taxonomy_gid("BREAKFAST") == (
+            "gid://shopify/TaxonomyCategory/fb-2-15-2"
+        )
+        assert category_taxonomy_gid("DESSERT") == (
+            "gid://shopify/TaxonomyCategory/fb-2-15-3"
+        )
+        assert category_taxonomy_gid("SNACK") == (
+            "gid://shopify/TaxonomyCategory/fb-2-17"
+        )
+
+    def test_drinks_maps_to_beverages(self):
+        assert category_taxonomy_gid("DRINKS") == (
+            "gid://shopify/TaxonomyCategory/fb-1"
+        )
+
+    def test_unmapped_categories_return_none(self):
+        # VACUUM / NON_FOOD are deliberately uncategorized → 21% standard rate.
+        assert category_taxonomy_gid("VACUUM") is None
+        assert category_taxonomy_gid("NON_FOOD") is None
+
+    def test_unknown_or_empty_returns_none(self):
+        assert category_taxonomy_gid("BOGUS") is None
+        assert category_taxonomy_gid(None) is None
+        assert category_taxonomy_gid("") is None
 
 
 class TestFormatPrice:
@@ -772,10 +821,8 @@ class TestDiffProduct:
             "tags": "a, b, c",
             "product_type": "Repas",
             "variants": [
-                {"sku": "fresheo-42-standard", "price": "9.50",
-                 "option1": "Standard", "inventory_management": None},
-                {"sku": "fresheo-42-large", "price": "11.50",
-                 "option1": "Large", "inventory_management": None},
+                {"sku": "fresheo-42-1", "price": "9.50", "option1": "Standard"},
+                {"sku": "fresheo-42-2", "price": "11.50", "option1": "Large"},
             ],
             "options": [{"name": "Size", "values": ["Standard", "Large"]}],
         }
@@ -789,7 +836,10 @@ class TestDiffProduct:
             "product_type": p["product_type"],
             "variants": [
                 {"sku": v["sku"], "price": v["price"], "option1": v["option1"],
-                 "inventory_management": v["inventory_management"]}
+                 # Untracked existing variant (steady state after the GraphQL
+                 # disable). `inventory_management` lives on the existing shape
+                 # but is intentionally ignored by `_variants_differ`.
+                 "inventory_management": None}
                 for v in p["variants"]
             ],
             "options": p["options"],
@@ -862,6 +912,49 @@ class TestDiffProduct:
         del payload["options"]
         diff = _diff_product(existing, payload)
         assert "options" not in diff
+
+
+class TestVariantsDiffer:
+    def test_equal_on_price_and_option(self):
+        a = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
+        b = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
+        assert _variants_differ(a, b) is False
+
+    def test_tracking_drift_alone_does_not_differ(self):
+        # The whole point of the 2024-04 decoupling: a tracked-vs-untracked
+        # mismatch must NOT force a variant replacement (it would churn IDs and
+        # break image links). Tracking is reconciled via GraphQL instead.
+        existing = [{"sku": "x", "price": "9.50", "option1": "Standard",
+                     "inventory_management": "shopify"}]
+        new = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
+        assert _variants_differ(existing, new) is False
+
+    def test_price_change_differs(self):
+        existing = [{"sku": "x", "price": "8.00", "option1": "Standard"}]
+        new = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
+        assert _variants_differ(existing, new) is True
+
+
+class TestNeedsTrackingDisable:
+    def test_tracked_variant_needs_disable(self):
+        assert _needs_tracking_disable(
+            [{"sku": "x", "inventory_management": "shopify"}]
+        ) is True
+
+    def test_all_untracked_needs_nothing(self):
+        assert _needs_tracking_disable(
+            [{"sku": "x", "inventory_management": None},
+             {"sku": "y", "inventory_management": None}]
+        ) is False
+
+    def test_any_tracked_variant_triggers(self):
+        assert _needs_tracking_disable(
+            [{"sku": "x", "inventory_management": None},
+             {"sku": "y", "inventory_management": "shopify"}]
+        ) is True
+
+    def test_empty_list(self):
+        assert _needs_tracking_disable([]) is False
 
 
 class TestDiffImages:
@@ -1227,10 +1320,8 @@ class TestMealsLoad:
             {"name": "Size", "values": ["Standard", "Large"]}
         ]
         assert sent_payload["variants"] == [
-            {"price": "9.50",  "option1": "Standard", "sku": "fresheo-42-standard",
-             "inventory_management": None},
-            {"price": "11.50", "option1": "Large",    "sku": "fresheo-42-large",
-             "inventory_management": None},
+            {"price": "9.50",  "option1": "Standard", "sku": "fresheo-42-1"},
+            {"price": "11.50", "option1": "Large",    "sku": "fresheo-42-2"},
         ]
 
     async def test_single_variant_category_omits_options(
@@ -1240,9 +1331,10 @@ class TestMealsLoad:
         # no Size option set on the product.
         sample_meal["category"] = "DRINKS"
         sample_meal["category_label"] = "Boissons"
+        sample_meal["category_gid"] = "gid://shopify/TaxonomyCategory/fb-1"
         sample_meal["options"] = []
         sample_meal["variants"] = [
-            {"price": "2.50", "sku": "fresheo-42", "inventory_management": None},
+            {"price": "2.50", "sku": "fresheo-42"},
         ]
 
         mock_dest_client.get = AsyncMock(return_value={"products": []})
@@ -1258,7 +1350,7 @@ class TestMealsLoad:
         sent = mock_dest_client.post.await_args.args[1]["product"]
         assert "options" not in sent
         assert sent["variants"] == [
-            {"price": "2.50", "sku": "fresheo-42", "inventory_management": None},
+            {"price": "2.50", "sku": "fresheo-42"},
         ]
 
     async def test_update_replaces_variants_via_product_put(
@@ -1508,6 +1600,7 @@ class TestMealsLoad:
             publications={"gid://shopify/Publication/1": True,
                           "gid://shopify/Publication/2": True},
             selling_plan_group_ids=["gid://shopify/SellingPlanGroup/500"],
+            category_gid=sample_meal.get("category_gid"),
         )
 
     async def test_unchanged_meal_makes_no_writes(
@@ -1725,6 +1818,217 @@ class TestMealsLoad:
         body = link_puts[0].args[1]["image"]
         assert body["id"] == 777
         assert sorted(body["variant_ids"]) == [5001, 5002]
+
+    async def test_create_disables_inventory_tracking_on_variants(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # POST returns the new variant IDs; _create must follow up with a
+        # productVariantsBulkUpdate setting inventoryItem.tracked=false on each
+        # — the REST inventory_management field is a no-op on API 2024-04+.
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql())
+        mock_dest_client.post = AsyncMock(return_value={"product": {
+            "id": 9001,
+            "variants": [{"id": 5001}, {"id": 5002}],
+        }})
+        mock_dest_client.put = AsyncMock(return_value={})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        gql_calls = mock_dest_client.graphql.await_args_list
+        disable_calls = [
+            c for c in gql_calls if "productVariantsBulkUpdate" in c.args[0]
+        ]
+        assert len(disable_calls) == 1
+        vars_ = disable_calls[0].kwargs["variables"]
+        assert vars_["productId"] == "gid://shopify/Product/9001"
+        assert vars_["variants"] == [
+            {"id": "gid://shopify/ProductVariant/5001",
+             "inventoryItem": {"tracked": False}},
+            {"id": "gid://shopify/ProductVariant/5002",
+             "inventoryItem": {"tracked": False}},
+        ]
+
+    async def test_existing_tracked_variant_disabled_without_other_writes(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # An already-synced product whose variants are still (wrongly) tracked.
+        # Nothing else differs → no PUT/POST/DELETE, but a productVariantsBulkUpdate
+        # must fire to flip tracking off on the existing variant IDs.
+        existing = await self._matching_existing(sample_meal)
+        for edge in existing["variants"]["edges"]:
+            edge["node"]["inventoryItem"]["tracked"] = True
+        mock_dest_client.get = AsyncMock(return_value={"products": [{
+            "id": 9001, "admin_graphql_api_id": "gid://shopify/Product/9001",
+            "title": sample_meal["name"], "handle": _slugify(sample_meal["name"]),
+        }]})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            get_product_response=existing,
+        ))
+        mock_dest_client.put = AsyncMock(return_value={})
+        mock_dest_client.delete = AsyncMock(return_value=None)
+        mock_dest_client.post = AsyncMock(return_value={})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        # Tracking is its own concern — no body PUT, no image writes.
+        mock_dest_client.put.assert_not_awaited()
+        mock_dest_client.post.assert_not_awaited()
+        mock_dest_client.delete.assert_not_awaited()
+        # Disabled on the existing variant IDs (5001, 5002 per _existing_node).
+        gql_calls = mock_dest_client.graphql.await_args_list
+        disable_calls = [
+            c for c in gql_calls if "productVariantsBulkUpdate" in c.args[0]
+        ]
+        assert len(disable_calls) == 1
+        sent = disable_calls[0].kwargs["variables"]["variants"]
+        assert [v["id"] for v in sent] == [
+            "gid://shopify/ProductVariant/5001",
+            "gid://shopify/ProductVariant/5002",
+        ]
+        assert all(v["inventoryItem"] == {"tracked": False} for v in sent)
+
+    async def test_untracked_existing_variant_skips_disable(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # Steady state: existing variants already untracked and nothing changed
+        # → fully idempotent, no productVariantsBulkUpdate (no re-PUT loop).
+        existing = await self._matching_existing(sample_meal)  # tracked=False
+        mock_dest_client.get = AsyncMock(return_value={"products": [{
+            "id": 9001, "admin_graphql_api_id": "gid://shopify/Product/9001",
+            "title": sample_meal["name"], "handle": _slugify(sample_meal["name"]),
+        }]})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            get_product_response=existing,
+        ))
+        mock_dest_client.put = AsyncMock(return_value={})
+        mock_dest_client.delete = AsyncMock(return_value=None)
+        mock_dest_client.post = AsyncMock(return_value={})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        gql_calls = mock_dest_client.graphql.await_args_list
+        assert not any(
+            "productVariantsBulkUpdate" in c.args[0] for c in gql_calls
+        )
+
+    async def test_create_sets_taxonomy_category(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # MAIN_DISH → fb-2-15-2; create must follow up with a productUpdate
+        # carrying that taxonomy GID (REST create can't set the category).
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql())
+        mock_dest_client.post = AsyncMock(return_value={"product": {"id": 9001}})
+        mock_dest_client.put = AsyncMock(return_value={})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        gql_calls = mock_dest_client.graphql.await_args_list
+        cat_calls = [c for c in gql_calls if "setCategory" in c.args[0]]
+        assert len(cat_calls) == 1
+        product = cat_calls[0].kwargs["variables"]["product"]
+        assert product == {
+            "id": "gid://shopify/Product/9001",
+            "category": "gid://shopify/TaxonomyCategory/fb-2-15-2",
+        }
+
+    async def test_unmapped_category_skips_productupdate_on_create(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # VACUUM is deliberately uncategorized (→ 21%). No category GID means no
+        # productUpdate — the product is left uncategorized, never cleared.
+        sample_meal["category"] = "VACUUM"
+        sample_meal["category_gid"] = None
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql())
+        mock_dest_client.post = AsyncMock(return_value={"product": {"id": 9001}})
+        mock_dest_client.put = AsyncMock(return_value={})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        gql_calls = mock_dest_client.graphql.await_args_list
+        assert not any("setCategory" in c.args[0] for c in gql_calls)
+
+    async def test_update_sets_category_when_existing_differs(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # Already-synced product with no category assigned. Everything else
+        # matches → only a productUpdate to assign the taxonomy node fires.
+        existing = await self._matching_existing(sample_meal)
+        existing["category"] = None  # not yet categorized
+        mock_dest_client.get = AsyncMock(return_value={"products": [{
+            "id": 9001, "admin_graphql_api_id": "gid://shopify/Product/9001",
+            "title": sample_meal["name"], "handle": _slugify(sample_meal["name"]),
+        }]})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            get_product_response=existing,
+        ))
+        mock_dest_client.put = AsyncMock(return_value={})
+        mock_dest_client.delete = AsyncMock(return_value=None)
+        mock_dest_client.post = AsyncMock(return_value={})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        # Category is its own concern — no body PUT, no image writes.
+        mock_dest_client.put.assert_not_awaited()
+        mock_dest_client.post.assert_not_awaited()
+        gql_calls = mock_dest_client.graphql.await_args_list
+        cat_calls = [c for c in gql_calls if "setCategory" in c.args[0]]
+        assert len(cat_calls) == 1
+        assert cat_calls[0].kwargs["variables"]["product"]["category"] == (
+            "gid://shopify/TaxonomyCategory/fb-2-15-2"
+        )
+
+    async def test_update_skips_category_when_already_correct(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # Existing already carries the right taxonomy node → idempotent, no
+        # productUpdate (no re-write loop).
+        existing = await self._matching_existing(sample_meal)  # category matches
+        mock_dest_client.get = AsyncMock(return_value={"products": [{
+            "id": 9001, "admin_graphql_api_id": "gid://shopify/Product/9001",
+            "title": sample_meal["name"], "handle": _slugify(sample_meal["name"]),
+        }]})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            get_product_response=existing,
+        ))
+        mock_dest_client.put = AsyncMock(return_value={})
+        mock_dest_client.delete = AsyncMock(return_value=None)
+        mock_dest_client.post = AsyncMock(return_value={})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        gql_calls = mock_dest_client.graphql.await_args_list
+        assert not any("setCategory" in c.args[0] for c in gql_calls)
 
     async def test_create_skips_link_when_no_variants_in_response(
         self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal

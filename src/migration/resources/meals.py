@@ -49,6 +49,7 @@ _GQL_PRODUCT_FIELDS = """
   bodyHtml
   tags
   productType
+  category { id }
   options { id name position values }
   variants(first: 20) {
     edges { node {
@@ -133,8 +134,11 @@ def _diff_product(existing: dict, payload: dict) -> dict:
     Comparisons:
       - title / body_html / product_type: string equality.
       - tags: CSV set equality (order/whitespace insensitive).
-      - variants: keyed by sku on (price, option1, inventory_management);
-        any mismatch emits the full new variants list.
+      - variants: keyed by sku on (price, option1); any mismatch emits the full
+        new variants list. Inventory tracking is intentionally NOT compared
+        here — it's handled out-of-band via GraphQL (see
+        [[_needs_tracking_disable]] / [[MealsResource._disable_inventory_tracking]])
+        because the REST inventory_management field was removed in API 2024-04.
       - options: [(name, sorted(values))] tuple equality; any mismatch emits
         the full new options list.
     """
@@ -166,19 +170,34 @@ def _diff_product(existing: dict, payload: dict) -> dict:
 
 
 def _variants_differ(existing: list[dict], new: list[dict]) -> bool:
-    """Variants are 'equal' when keyed-by-SKU dicts match on price, option1,
-    and inventory_management. SKU is the stable cross-run key the migrator
-    sets deterministically in [[_build_variants]]."""
+    """Variants are 'equal' when keyed-by-SKU dicts match on price and option1.
+    SKU is the stable cross-run key the migrator sets deterministically in
+    [[_build_variants]]. Inventory tracking is excluded on purpose: a tracking
+    mismatch must not trigger a full variant replacement (that would churn
+    variant IDs and break variant↔image links) — it's reconciled separately via
+    [[_needs_tracking_disable]] and a GraphQL productVariantsBulkUpdate."""
     def by_sku(items: list[dict]) -> dict[str, tuple]:
         return {
             (v.get("sku") or ""): (
                 v.get("price"),
                 v.get("option1"),
-                v.get("inventory_management"),
             )
             for v in items
         }
     return by_sku(existing) != by_sku(new)
+
+
+def _needs_tracking_disable(existing_variants: list[dict]) -> bool:
+    """True when any existing variant still has Shopify stock tracking enabled.
+
+    [[MealsResource._normalize_graphql_node]] maps InventoryItem.tracked back to
+    the REST-shaped `inventory_management` ('shopify' = tracked, None =
+    untracked). Meals are made-to-order and must always be untracked, so a
+    tracked variant means we owe a GraphQL productVariantsBulkUpdate to turn it
+    off (see [[MealsResource._disable_inventory_tracking]])."""
+    return any(
+        v.get("inventory_management") == "shopify" for v in existing_variants
+    )
 
 
 def _options_differ(existing: list[dict], new: list[dict]) -> bool:
@@ -271,6 +290,25 @@ _GQL_ADD_PRODUCTS_TO_SPG = """
 mutation sellingPlanGroupAddProducts($id: ID!, $productIds: [ID!]!) {
   sellingPlanGroupAddProducts(id: $id, productIds: $productIds) {
     sellingPlanGroup { id }
+    userErrors { field message }
+  }
+}
+"""
+
+
+_GQL_DISABLE_VARIANT_TRACKING = """
+mutation disableTracking($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+    userErrors { field message }
+  }
+}
+"""
+
+
+_GQL_SET_PRODUCT_CATEGORY = """
+mutation setCategory($product: ProductUpdateInput!) {
+  productUpdate(product: $product) {
+    product { id category { id } }
     userErrors { field message }
   }
 }
@@ -408,9 +446,14 @@ class MealsResource(BaseResource):
                 return None
 
             if not existing:
-                dest_id = await self._create(payload)
+                dest_id = await self._create(payload, title)
                 logger.info(f"[load] meal '{title}': created (dest_id={dest_id})")
                 product_gid = f"gid://shopify/Product/{dest_id}"
+                # Assign the taxonomy category (drives Belgian VAT). REST create
+                # can't set it, so it's a follow-up GraphQL productUpdate.
+                await self._set_product_category(
+                    product_gid, item.get("category_gid"), title
+                )
                 # New product: publication state + SPG association run once.
                 await self._sync_publications(
                     product_gid, item.get("is_active_today", True), title
@@ -438,8 +481,20 @@ class MealsResource(BaseResource):
             needs_spg = _needs_subscription_association(
                 existing.get("selling_plan_group_ids") or [], spg_gid,
             )
+            # Any existing variant still tracked must be flipped off — meals are
+            # made-to-order. This is its own concern (GraphQL), independent of
+            # the variant body diff above.
+            needs_tracking = _needs_tracking_disable(existing.get("variants") or [])
+            # Taxonomy category (VAT). Only write when we have a desired node
+            # and it differs — unmapped categories (desired None) are left
+            # uncategorized on purpose, never cleared.
+            desired_category = item.get("category_gid")
+            needs_category = bool(desired_category) and (
+                desired_category != existing.get("category_gid")
+            )
 
-            if not (body_diff or images_changed or pub_diff or needs_spg):
+            if not (body_diff or images_changed or pub_diff or needs_spg
+                    or needs_tracking or needs_category):
                 logger.info(
                     f"[load] meal '{title}': unchanged, skipping (dest_id={dest_id})"
                 )
@@ -456,6 +511,9 @@ class MealsResource(BaseResource):
                 if "variants" in body_diff:
                     new_variants = (put_resp.get("product") or {}).get("variants") or []
                     variant_ids = [str(v["id"]) for v in new_variants if v.get("id")]
+                    # Replaced variants are brand-new rows that inherit the
+                    # store's tracked default — always re-disable on them.
+                    needs_tracking = True
             if images_changed:
                 await self._refresh_images(
                     dest_id, existing.get("image_ids") or [],
@@ -465,6 +523,16 @@ class MealsResource(BaseResource):
                 await self._sync_publications_for(product_gid, pub_diff, title)
             if needs_spg:
                 await self._associate_subscription(product_gid, title)
+            if needs_tracking:
+                await self._disable_inventory_tracking(
+                    product_gid,
+                    [f"gid://shopify/ProductVariant/{vid}" for vid in variant_ids],
+                    title,
+                )
+            if needs_category:
+                await self._set_product_category(
+                    product_gid, desired_category, title
+                )
 
             logger.info(f"[load] meal '{title}': updated (dest_id={dest_id})")
             self.id_map.set(source_id, dest_id)
@@ -574,6 +642,7 @@ class MealsResource(BaseResource):
             "body_html":              node.get("bodyHtml", "") or "",
             "tags":                   list(node.get("tags") or []),
             "product_type":           node.get("productType", "") or "",
+            "category_gid":           (node.get("category") or {}).get("id"),
             "options":                options,
             "variants":               variants,
             "image_ids": [
@@ -654,14 +723,22 @@ class MealsResource(BaseResource):
                 f"[load] meal '{title}': failed to write image_sources metafield: {exc}"
             )
 
-    async def _create(self, payload: dict) -> str:
-        """POST the product, then link every variant to the (single) product
-        image so the variant page's image is set."""
+    async def _create(self, payload: dict, title: str) -> str:
+        """POST the product, disable inventory tracking on every freshly created
+        variant, then link every variant to the (single) product image so the
+        variant page's image is set."""
         response = await self.dest.post(self.endpoint, {self.resource_key: payload})
         resource = response.get(self.resource_key, {})
         dest_id = str(resource["id"])
 
         variant_ids = [str(v["id"]) for v in resource.get("variants") or []]
+        # Variants Shopify just created inherit the store-level inventory
+        # default (usually tracked). Meals are made-to-order — turn it off.
+        await self._disable_inventory_tracking(
+            f"gid://shopify/Product/{dest_id}",
+            [f"gid://shopify/ProductVariant/{vid}" for vid in variant_ids],
+            title,
+        )
         for image in resource.get("images") or []:
             image_id = image.get("id")
             if not image_id or not variant_ids:
@@ -680,6 +757,73 @@ class MealsResource(BaseResource):
                     f"to image {image_id}: {exc}"
                 )
         return dest_id
+
+    async def _disable_inventory_tracking(
+        self, product_gid: str, variant_gids: list[str], title: str,
+    ) -> None:
+        """Turn off Shopify stock tracking (`inventoryItem.tracked = false`) on
+        every given variant via GraphQL.
+
+        The REST `inventory_management` field was removed in API 2024-04, so on
+        the version this store runs this mutation is the only way to disable
+        tracking. Meals are made-to-order — without it they inherit the store
+        default (tracked) and surface a false out-of-stock state. Idempotent:
+        re-setting tracked=false is a no-op, and variant IDs are preserved so
+        variant↔image links survive. Per-product failures are logged, not raised.
+        """
+        if not variant_gids:
+            return
+        variants_input = [
+            {"id": gid, "inventoryItem": {"tracked": False}}
+            for gid in variant_gids
+        ]
+        try:
+            data = await self.dest.graphql(
+                _GQL_DISABLE_VARIANT_TRACKING,
+                variables={"productId": product_gid, "variants": variants_input},
+                estimated_cost=50,
+            )
+            errors = (
+                data.get("productVariantsBulkUpdate", {}).get("userErrors", [])
+            )
+            if errors:
+                logger.warning(
+                    f"[load] meal '{title}': disable-tracking userErrors: {errors}"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"[load] meal '{title}': failed to disable inventory tracking: {exc}"
+            )
+
+    async def _set_product_category(
+        self, product_gid: str, category_gid: Optional[str], title: str,
+    ) -> None:
+        """Assign the Shopify Standard Product Taxonomy category via GraphQL
+        productUpdate. This category — not the free-text product_type — is what
+        Shopify Tax reads to apply the Belgian VAT rate (food nodes → 6%).
+
+        REST product create/update can't set the standard category, hence the
+        separate mutation. A None `category_gid` means 'leave uncategorized'
+        (→ 21% standard rate); we skip rather than clear. Per-product failures
+        are logged, not raised."""
+        if not category_gid:
+            return
+        try:
+            data = await self.dest.graphql(
+                _GQL_SET_PRODUCT_CATEGORY,
+                variables={"product": {"id": product_gid, "category": category_gid}},
+                estimated_cost=50,
+            )
+            errors = data.get("productUpdate", {}).get("userErrors", [])
+            if errors:
+                logger.warning(
+                    f"[load] meal '{title}': set-category userErrors: {errors}"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"[load] meal '{title}': failed to set taxonomy category "
+                f"{category_gid}: {exc}"
+            )
 
     # ── PUBLICATIONS ─────────────────────────────────────────────────────────
 
