@@ -44,7 +44,7 @@ FROM menu_meal m
     LIMIT 1
     ) nv ON TRUE
 WHERE m.visible_for_customers = TRUE
-  AND (m.inactive_on IS NULL OR m.inactive_on > CURRENT_DATE)
+  AND (m.inactive_on IS NULL OR m.inactive_on >= CURRENT_DATE)
 ORDER BY m.id;
 """
 

@@ -1,0 +1,31 @@
+# Copy this file to `dev.auto.tfvars` and edit. `*.tfvars` is gitignored.
+#
+# Each tenant gets a Secrets Manager secret at `shopify-migrator/dev/<key>`
+# that you populate manually via the AWS console with the JSON:
+#   {
+#     "DEST_SHOP_DOMAIN":    "...",
+#     "DEST_CLIENT_ID":      "...",
+#     "DEST_CLIENT_SECRET":  "...",
+#     "DEST_ACCESS_TOKEN":   "...",
+#     "DJANGO_DATABASE_URL": "postgresql://...",
+#     "DJANGO_MEDIA_URL":    "..."
+#   }
+#
+# Each job becomes:
+#   - ECS task definition `shopify-migrator-<job_key>`
+#   - EventBridge schedule `shopify-migrator-<job_key>` (state controlled by `enabled`)
+
+tenants = {
+  "fresheo-be" = { description = "Fresheo Belgium" }
+  # "fresheo-fr" = { description = "Fresheo France" }
+}
+
+jobs = {
+  "fresheo-be-sync-meals" = {
+    tenant   = "fresheo-be"
+    command  = ["sync-meals"]
+    schedule = "cron(0 1 * * ? *)" # 06:00 UTC daily
+    env      = { MEAL_LOCALE = "fr" }
+    enabled  = false # flip to true after a successful manual run-task
+  }
+}

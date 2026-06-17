@@ -77,7 +77,7 @@ def load_config() -> Config:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     return Config(
-        source_shop=_require("SOURCE_SHOP_DOMAIN"),
+        source_shop=_optional("SOURCE_SHOP_DOMAIN", ""),
         source_token=_optional("SOURCE_ACCESS_TOKEN", ""),
         source_client_id=_optional("SOURCE_CLIENT_ID", ""),
         source_client_secret=_optional("SOURCE_CLIENT_SECRET", ""),

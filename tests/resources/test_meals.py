@@ -194,16 +194,21 @@ def _smart_graphql(
     *,
     selling_plan_group_response=None,
     get_product_response=None,
+    products_by_tag_edges=None,
 ):
     """Build a graphql side_effect that routes by query string. Handles the
     queries MealsResource issues per meal: listPublications, title-search,
-    get-by-id, publish/unpublish, the subscription group lookup, and the
-    SPG-add mutation.
+    get-by-id, publish/unpublish, the subscription group lookup, the
+    SPG-add mutation, and the post-load `productsByTag` reconciliation sweep.
 
     By default `get_product_response` is None — the by-id query returns
     `{"product": None}`, which combined with an empty title_search_response
     matches the "no existing product" path. Tests exercising the update path
     pass an `_existing_node(...)` as `get_product_response`.
+
+    `products_by_tag_edges` seeds the reconciliation sweep — a list of
+    {id, legacyResourceId, title, tags} node dicts; defaults to empty (no
+    products carry the tag, so the sweep is a no-op).
     """
     title_search_response = title_search_response or {"products": {"edges": []}}
     selling_plan_group_response = selling_plan_group_response or {
@@ -245,6 +250,11 @@ def _smart_graphql(
             return {"product": get_product_response}
         if "findByTitle" in query:
             return title_search_response
+        if "productsByTag" in query:
+            return {"products": {
+                "edges": [{"node": n} for n in (products_by_tag_edges or [])],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}
         raise AssertionError(f"Unhandled GraphQL query:\n{query}")
 
     return graphql
@@ -1301,6 +1311,66 @@ class TestMealsLoad:
         sent_tags = mock_dest_client.put.await_args_list[0].args[1]["product"]["tags"]
         assert "current-menu" not in sent_tags
         assert sent_tags == "main-dish, meat, nutri-a, sans-gluten"
+
+    async def test_reconcile_strips_current_menu_from_absent_meals(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # One active meal in the extract → created as product 9001 (kept). The
+        # store also carries 'current-menu' on product 7777, a meal that has
+        # dropped out of the menu and is absent from the extract entirely. The
+        # post-load reconciliation sweep must strip the tag from 7777 only.
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.post = AsyncMock(
+            return_value={"product": {"id": 9001, "variants": [], "images": []}}
+        )
+        mock_dest_client.put = AsyncMock(return_value={})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            products_by_tag_edges=[
+                {"id": "gid://shopify/Product/9001", "legacyResourceId": "9001",
+                 "title": sample_meal["name"], "tags": ["current-menu", "main-dish"]},
+                {"id": "gid://shopify/Product/7777", "legacyResourceId": "7777",
+                 "title": "Vieux plat", "tags": ["current-menu", "dessert"]},
+            ],
+        ))
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        # Reconciliation PUTs target the product root (not the /images/ subpath)
+        # and carry a tags field.
+        reconcile_puts = [
+            c for c in mock_dest_client.put.await_args_list
+            if "/images/" not in c.args[0] and "tags" in c.args[1].get("product", {})
+        ]
+        assert len(reconcile_puts) == 1
+        assert reconcile_puts[0].args[0] == "products/7777.json"
+        # current-menu stripped; the meal's other tags are preserved.
+        assert reconcile_puts[0].args[1]["product"]["tags"] == "dessert"
+
+    async def test_reconcile_dry_run_makes_no_writes(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.put = AsyncMock(return_value={})
+        mock_dest_client.post = AsyncMock(return_value={})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            products_by_tag_edges=[
+                {"id": "gid://shopify/Product/7777", "legacyResourceId": "7777",
+                 "title": "Vieux plat", "tags": ["current-menu", "dessert"]},
+            ],
+        ))
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer,
+            dry_run=True,
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        mock_dest_client.put.assert_not_awaited()
 
     async def test_create_payload_includes_variants_and_options(
         self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal

@@ -17,6 +17,11 @@ from .base import BaseResource
 
 logger = logging.getLogger(__name__)
 
+# Migrator-managed tag flagging a meal as part of the active menu. Added by
+# django_db._build_tags when a meal's window includes today; stripped from
+# products that are no longer active by [[MealsResource._reconcile_current_menu_tags]].
+_CURRENT_MENU_TAG = "current-menu"
+
 
 def _slugify(title: str) -> str:
     """Deterministic Shopify-compatible handle. Same input → same handle every
@@ -315,6 +320,16 @@ mutation setCategory($product: ProductUpdateInput!) {
 """
 
 
+_GQL_PRODUCTS_BY_TAG = """
+query productsByTag($query: String!, $cursor: String) {
+  products(first: 250, query: $query, after: $cursor) {
+    edges { node { id legacyResourceId title tags } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+
 class MealsResource(BaseResource):
     """Push Fresheo Django meals into the destination Shopify store.
 
@@ -367,6 +382,108 @@ class MealsResource(BaseResource):
         self._subscription_group_code = subscription_group_code
         self._subscription_group_gid: Optional[str] = None
         self._subscription_lookup_done: bool = False
+
+    # ── LOAD (orchestration) ─────────────────────────────────────────────────
+
+    async def load(self, force: bool = False) -> None:
+        """Run the standard upsert loop, then reconcile the `current-menu` tag.
+
+        The per-meal upsert only ever touches meals still present in the Django
+        extract. Meals whose active window has expired drop out of that extract
+        entirely (see `django_db._MEALS_SQL`), so the upsert never re-processes
+        them and their stale `current-menu` tag would linger forever. The
+        reconciliation pass closes that gap: it queries the destination for
+        every product still carrying the tag and strips it from any whose meal
+        is no longer active today."""
+        await super().load(force)
+        await self._reconcile_current_menu_tags()
+
+    async def _reconcile_current_menu_tags(self) -> None:
+        """Strip `current-menu` from destination products whose meal is no
+        longer in the active menu.
+
+        Authoritative 'keep' set = the destination IDs of meals flagged
+        `is_active_today` in this run's extract, resolved via the id_map. Any
+        product tagged `current-menu` on the store but absent from that set is
+        considered stale and gets the tag removed. Self-correcting: if an active
+        meal failed to load (so its id never reached the id_map) and is wrongly
+        stripped here, the next successful run re-adds the tag via the normal
+        diff path."""
+        if not self._data_file.exists():
+            return
+        items: list[dict] = json.loads(self._data_file.read_text(encoding="utf-8"))
+
+        keep_ids: set[str] = set()
+        for item in items:
+            if item.get("is_active_today"):
+                dest_id = self.id_map.get(str(item.get("meal_id", "")))
+                if dest_id:
+                    keep_ids.add(str(dest_id))
+
+        tagged = await self._fetch_products_tagged(_CURRENT_MENU_TAG)
+        stale = [p for p in tagged if p["legacyResourceId"] not in keep_ids]
+
+        if self.dry_run:
+            logger.info(
+                f"[DRY RUN][reconcile] {len(tagged)} product(s) tagged "
+                f"'{_CURRENT_MENU_TAG}'; {len(stale)} would have the tag stripped"
+            )
+            return
+
+        if not stale:
+            logger.info(
+                f"[reconcile] '{_CURRENT_MENU_TAG}': all {len(tagged)} tagged "
+                f"product(s) are active; nothing to strip"
+            )
+            return
+
+        logger.info(
+            f"[reconcile] '{_CURRENT_MENU_TAG}': stripping tag from {len(stale)} "
+            f"product(s) no longer in the active menu"
+        )
+        for product in stale:
+            dest_id = product["legacyResourceId"]
+            title = product.get("title") or dest_id
+            new_tags = [t for t in product["tags"] if t != _CURRENT_MENU_TAG]
+            try:
+                await self._update_product_sparse(
+                    dest_id, {"tags": ", ".join(new_tags)}, title
+                )
+                logger.info(
+                    f"[reconcile] meal '{title}': stripped '{_CURRENT_MENU_TAG}' "
+                    f"(dest_id={dest_id})"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[reconcile] meal '{title}': failed to strip "
+                    f"'{_CURRENT_MENU_TAG}' (dest_id={dest_id}): {exc}"
+                )
+
+    async def _fetch_products_tagged(self, tag: str) -> list[dict]:
+        """Return all destination products carrying `tag`, following GraphQL
+        cursor pagination. Each entry is {id, legacyResourceId, title, tags}."""
+        results: list[dict] = []
+        cursor: Optional[str] = None
+        while True:
+            data = await self.dest.graphql(
+                _GQL_PRODUCTS_BY_TAG,
+                variables={"query": f"tag:{tag}", "cursor": cursor},
+                estimated_cost=250,
+            )
+            conn = data.get("products", {}) or {}
+            for edge in conn.get("edges", []):
+                node = edge["node"]
+                results.append({
+                    "id":               node["id"],
+                    "legacyResourceId": str(node.get("legacyResourceId") or ""),
+                    "title":            node.get("title") or "",
+                    "tags":             list(node.get("tags") or []),
+                })
+            page_info = conn.get("pageInfo", {}) or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+        return results
 
     # ── EXTRACT ──────────────────────────────────────────────────────────────
 
