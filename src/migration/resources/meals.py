@@ -65,6 +65,12 @@ _GQL_PRODUCT_FIELDS = """
   }
   images(first: 50) { edges { node { id } } }
   metafield(namespace: "fresheo", key: "image_sources") { value }
+  mf_nutri_score: metafield(namespace: "fresheo", key: "nutri_score") { value }
+  mf_nutrition: metafield(namespace: "fresheo", key: "nutrition") { value }
+  mf_cooking: metafield(namespace: "fresheo", key: "cooking_instructions") { value }
+  mf_author: metafield(namespace: "fresheo", key: "author") { value }
+  mf_allergens: metafield(namespace: "shopify", key: "allergen-information") { value }
+  mf_diets: metafield(namespace: "shopify", key: "dietary-preferences") { value }
   resourcePublicationsV2(first: 50) {
     edges { node { publication { id } isPublished } }
   }
@@ -125,6 +131,170 @@ def _serialize_image_sources(urls: list[str]) -> str:
     """Inverse of [[_parse_image_sources]] — emits JSON suitable for the
     `list.url` metafield type."""
     return json.dumps(list(urls))
+
+
+# ── Managed product metafields ───────────────────────────────────────────────
+#
+# The migrator writes a set of product metafields derived from the Django meal
+# row, in addition to the bookkeeping `fresheo.image_sources` one above:
+#
+#   fresheo.nutri_score          single_line_text_field   A–E label
+#   fresheo.nutrition            json                      macro breakdown
+#   fresheo.cooking_instructions json                      microwave/oven/cold
+#   fresheo.author               single_line_text_field    chef (when present)
+#   shopify.allergen-information list.metaobject_reference  NATIVE (scope-gated)
+#   shopify.dietary-preferences  list.metaobject_reference  NATIVE (scope-gated)
+#
+# The two `shopify.*` ones are Shopify's native food category metafields; their
+# values are references to standard metaobject entries, resolved at runtime
+# (see [[MealsResource._get_reference_map]]). The `fresheo.*` ones are plain and
+# need no resolution. All are diffed against the live product and written via a
+# single `metafieldsSet` only when something changed, mirroring how publications
+# and the taxonomy category are reconciled.
+
+# Nutrition macro fields copied verbatim from the meal dict into the JSON value.
+_NUTRITION_FIELDS = [
+    "kilo_calories", "proteins", "carbohydrates", "lipids",
+    "sugars", "saturated", "fibers", "salts", "weight",
+]
+
+# DB allergen key → ordered candidate tokens matched (case/separator-insensitive)
+# against each standard allergen metaobject's handle, then its displayName. The
+# real Shopify handles couldn't be captured up front (the app lacks
+# `read_metaobjects`), so several plausible spellings are listed; the first hit
+# in the live reference map wins. Unmatched keys are logged, not fatal.
+_ALLERGEN_REFERENCE_ALIASES = {
+    "gluten":     ["gluten", "cereals-containing-gluten"],
+    "crustaceans": ["crustaceans", "crustacean"],
+    "eggs":       ["eggs", "egg"],
+    "sesame":     ["sesame", "sesame-seeds"],
+    "sulfite":    ["sulphites", "sulfites", "sulphur-dioxide-and-sulphites"],
+    "lupin":      ["lupin", "lupine"],
+    "fish":       ["fish"],
+    "peanut":     ["peanuts", "peanut"],
+    "soy":        ["soybeans", "soya", "soy"],
+    "milk":       ["milk", "dairy"],
+    "nuts":       ["tree-nuts", "nuts", "tree-nut"],
+    "celeri":     ["celery", "celeriac"],
+    "mustard":    ["mustard"],
+    "molluscs":   ["molluscs", "mollusks", "mollusc"],
+    # No standalone "lactose" allergen in the EU-14 list — it lives under milk.
+    "lactose":    ["lactose", "milk", "dairy"],
+}
+
+# DB diet key → candidate tokens for the standard dietary-preference metaobjects.
+# pork_free / paleo may have no standard equivalent; they simply stay unmatched.
+_DIET_REFERENCE_ALIASES = {
+    "vegetarian":   ["vegetarian"],
+    "gluten_free":  ["gluten-free", "gluten-free-diet"],
+    "lactose_free": ["lactose-free", "dairy-free"],
+    "pork_free":    ["pork-free", "no-pork", "halal"],
+    "paleo":        ["paleo", "paleo-friendly"],
+}
+
+
+def _canonical_metafield_value(value: Optional[str], mf_type: str) -> str:
+    """Normalize a metafield value string for order/whitespace-insensitive
+    comparison. JSON values are parsed and re-dumped with sorted keys so a
+    formatting-only difference doesn't look like a change; reference lists
+    (stored as a JSON array of GIDs) compare as sets. Everything else compares
+    as the raw string."""
+    if not value:
+        return ""
+    if mf_type == "json":
+        try:
+            return json.dumps(json.loads(value), sort_keys=True, separators=(",", ":"))
+        except json.JSONDecodeError:
+            return value
+    if mf_type == "list.metaobject_reference":
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return json.dumps(sorted(str(x) for x in parsed))
+        except json.JSONDecodeError:
+            pass
+    return value
+
+
+def _nutrition_payload(item: dict) -> Optional[dict]:
+    """Build the fresheo.nutrition JSON value from the meal's macros, or None
+    when every macro is missing/zero (nothing worth publishing)."""
+    data = {key: item.get(key) for key in _NUTRITION_FIELDS}
+    if not any(data.values()):
+        return None
+    return data
+
+
+def _build_managed_metafields(item: dict) -> list[dict]:
+    """Build the resolution-free `fresheo.*` metafields for a meal. Each entry
+    is {namespace, key, type, value}; empty/absent sources are skipped so we
+    never publish a blank metafield. The native `shopify.*` reference metafields
+    are added separately by [[MealsResource._build_native_metafields]] because
+    they require live metaobject GID resolution."""
+    metafields: list[dict] = []
+
+    nutri = (item.get("nutri_score") or "").strip()
+    if nutri:
+        metafields.append({
+            "namespace": "fresheo", "key": "nutri_score",
+            "type": "single_line_text_field", "value": nutri,
+        })
+
+    nutrition = _nutrition_payload(item)
+    if nutrition is not None:
+        metafields.append({
+            "namespace": "fresheo", "key": "nutrition",
+            "type": "json", "value": json.dumps(nutrition),
+        })
+
+    cooking = item.get("cooking")
+    if cooking:
+        metafields.append({
+            "namespace": "fresheo", "key": "cooking_instructions",
+            "type": "json", "value": json.dumps(cooking, ensure_ascii=False),
+        })
+
+    author = (item.get("author") or "").strip()
+    if author:
+        metafields.append({
+            "namespace": "fresheo", "key": "author",
+            "type": "single_line_text_field", "value": author,
+        })
+
+    return metafields
+
+
+def _normalize_reference_token(token: str) -> str:
+    """Lowercase a handle/name and collapse separators to single dashes so
+    'Tree Nuts', 'tree_nuts' and 'tree-nuts' all compare equal."""
+    return re.sub(r"[^a-z0-9]+", "-", (token or "").lower()).strip("-")
+
+
+def _match_reference(reference_map: dict[str, str], candidates: list[str]) -> Optional[str]:
+    """Return the metaobject GID for the first candidate token found in
+    `reference_map` (keyed by normalized handle AND normalized displayName), or
+    None when none match. See [[MealsResource._get_reference_map]] for how the
+    map is built."""
+    for candidate in candidates:
+        gid = reference_map.get(_normalize_reference_token(candidate))
+        if gid:
+            return gid
+    return None
+
+
+def _diff_metafields(existing: dict[str, str], desired: list[dict]) -> list[dict]:
+    """Return the subset of `desired` metafields whose canonical value differs
+    from what's on the product. `existing` maps 'namespace.key' → raw value
+    string (from [[MealsResource._normalize_graphql_node]]). Empty result ⇒
+    every managed metafield already matches, so no write is owed."""
+    changed: list[dict] = []
+    for mf in desired:
+        full_key = f"{mf['namespace']}.{mf['key']}"
+        old = _canonical_metafield_value(existing.get(full_key), mf["type"])
+        new = _canonical_metafield_value(mf["value"], mf["type"])
+        if old != new:
+            changed.append(mf)
+    return changed
 
 
 def _parse_tags_csv(value: str) -> set[str]:
@@ -330,6 +500,46 @@ query productsByTag($query: String!, $cursor: String) {
 """
 
 
+# Upsert product metafields by (ownerId, namespace, key). Used for the managed
+# fresheo.* metafields and the native shopify.* reference metafields.
+_GQL_METAFIELDS_SET = """
+mutation setMetafields($metafields: [MetafieldsSetInput!]!) {
+  metafieldsSet(metafields: $metafields) {
+    metafields { id namespace key }
+    userErrors { field message code }
+  }
+}
+"""
+
+# Resolve a native reference metafield's backing metaobject definition, then its
+# entries — needed to turn DB allergen/diet booleans into the metaobject GIDs
+# that `list.metaobject_reference` metafields store. Reading metaobjects requires
+# the `read_metaobjects` access scope; without it these return null/empty and the
+# native metafields are skipped (see [[MealsResource._get_reference_map]]).
+_GQL_GET_METAFIELD_DEFINITION = """
+query mfDef($namespace: String!, $key: String!) {
+  metafieldDefinitions(first: 1, ownerType: PRODUCT, namespace: $namespace, key: $key) {
+    edges { node { id validations { name value } } }
+  }
+}
+"""
+
+_GQL_GET_METAOBJECT_DEFINITION = """
+query moDef($id: ID!) {
+  metaobjectDefinition(id: $id) { type }
+}
+"""
+
+_GQL_LIST_METAOBJECTS = """
+query moList($type: String!, $cursor: String) {
+  metaobjects(type: $type, first: 250, after: $cursor) {
+    edges { node { id handle displayName } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+
 class MealsResource(BaseResource):
     """Push Fresheo Django meals into the destination Shopify store.
 
@@ -382,6 +592,13 @@ class MealsResource(BaseResource):
         self._subscription_group_code = subscription_group_code
         self._subscription_group_gid: Optional[str] = None
         self._subscription_lookup_done: bool = False
+        # Native reference metafields: cache of {(namespace, key): {token: gid}}
+        # resolved once per run. An empty map means the metaobjects couldn't be
+        # read (definition not enabled, or the app lacks read_metaobjects) — the
+        # native allergen/diet metafields are then skipped. `_ref_map_warned`
+        # de-dupes the one-time warning per (namespace, key).
+        self._reference_maps: dict[tuple[str, str], dict[str, str]] = {}
+        self._ref_map_warned: set[tuple[str, str]] = set()
 
     # ── LOAD (orchestration) ─────────────────────────────────────────────────
 
@@ -576,6 +793,14 @@ class MealsResource(BaseResource):
                     product_gid, item.get("is_active_today", True), title
                 )
                 await self._associate_subscription(product_gid, title)
+                # Managed metafields (nutrition, cooking, nutri-score, author,
+                # and native allergen/diet references). Fresh product → diff
+                # against an empty existing set, so everything available is written.
+                await self._write_metafields(
+                    product_gid,
+                    await self._compute_metafield_changes(item, {}),
+                    title,
+                )
                 self.id_map.set(source_id, dest_id)
                 self.progress.mark_item_done(self.resource_name, title, dest_id)
                 return dest_id
@@ -609,9 +834,15 @@ class MealsResource(BaseResource):
             needs_category = bool(desired_category) and (
                 desired_category != existing.get("category_gid")
             )
+            # Managed metafields are their own concern (GraphQL metafieldsSet),
+            # diffed against the live values so an unchanged meal isn't rewritten.
+            metafield_changes = await self._compute_metafield_changes(
+                item, existing.get("metafields") or {}
+            )
+            needs_metafields = bool(metafield_changes)
 
             if not (body_diff or images_changed or pub_diff or needs_spg
-                    or needs_tracking or needs_category):
+                    or needs_tracking or needs_category or needs_metafields):
                 logger.info(
                     f"[load] meal '{title}': unchanged, skipping (dest_id={dest_id})"
                 )
@@ -649,6 +880,10 @@ class MealsResource(BaseResource):
             if needs_category:
                 await self._set_product_category(
                     product_gid, desired_category, title
+                )
+            if needs_metafields:
+                await self._write_metafields(
+                    product_gid, metafield_changes, title
                 )
 
             logger.info(f"[load] meal '{title}': updated (dest_id={dest_id})")
@@ -739,6 +974,22 @@ class MealsResource(BaseResource):
         image_sources_value = (node.get("metafield") or {}).get("value") or ""
         image_sources = _parse_image_sources(image_sources_value)
 
+        # Managed metafields, keyed 'namespace.key' → raw value string, for the
+        # diff in [[_diff_metafields]]. Aliased in _GQL_PRODUCT_FIELDS so each
+        # comes back under its own field; a missing/unset metafield is None.
+        metafields: dict[str, str] = {}
+        for alias, full_key in (
+            ("mf_nutri_score", "fresheo.nutri_score"),
+            ("mf_nutrition", "fresheo.nutrition"),
+            ("mf_cooking", "fresheo.cooking_instructions"),
+            ("mf_author", "fresheo.author"),
+            ("mf_allergens", "shopify.allergen-information"),
+            ("mf_diets", "shopify.dietary-preferences"),
+        ):
+            value = (node.get(alias) or {}).get("value")
+            if value is not None:
+                metafields[full_key] = value
+
         # Per-publication state.
         publications: dict[str, bool] = {}
         for e in node.get("resourcePublicationsV2", {}).get("edges", []):
@@ -767,6 +1018,7 @@ class MealsResource(BaseResource):
                 for e in node.get("images", {}).get("edges", [])
             ],
             "image_sources":          image_sources,
+            "metafields":             metafields,
             "publications":           publications,
             "selling_plan_group_ids": spg_ids,
         }
@@ -940,6 +1192,208 @@ class MealsResource(BaseResource):
             logger.warning(
                 f"[load] meal '{title}': failed to set taxonomy category "
                 f"{category_gid}: {exc}"
+            )
+
+    # ── METAFIELDS ───────────────────────────────────────────────────────────
+
+    async def _compute_metafield_changes(
+        self, item: dict, existing_metafields: dict[str, str],
+    ) -> list[dict]:
+        """Build the desired managed metafields for a meal (plain `fresheo.*`
+        plus native `shopify.*` references) and return only those whose value
+        differs from what's already on the product. Empty list ⇒ nothing to
+        write. Used by both the create path (existing={}) and the update path's
+        diff so an otherwise-unchanged meal isn't re-written every run."""
+        desired = _build_managed_metafields(item)
+        desired += await self._build_native_metafields(item)
+        return _diff_metafields(existing_metafields or {}, desired)
+
+    async def _build_native_metafields(self, item: dict) -> list[dict]:
+        """Build the native `shopify.allergen-information` /
+        `shopify.dietary-preferences` reference metafields from the meal's
+        structured recipe flags.
+
+        Skipped entirely when the meal has no linked recipe (`*_struct` is None)
+        or when no recipe flag is set (empty list) — we don't publish an empty
+        reference set. Also a no-op when the backing metaobjects can't be read
+        (definition disabled or missing `read_metaobjects` scope), in which case
+        [[_get_reference_map]] returns an empty map and `_resolve_reference_gids`
+        yields nothing. Once the scope is granted these light up automatically."""
+        metafields: list[dict] = []
+
+        allergens = item.get("allergens_struct")
+        if allergens:
+            gids = await self._resolve_reference_gids(
+                "shopify", "allergen-information",
+                allergens, _ALLERGEN_REFERENCE_ALIASES, item,
+            )
+            if gids:
+                metafields.append({
+                    "namespace": "shopify", "key": "allergen-information",
+                    "type": "list.metaobject_reference", "value": json.dumps(gids),
+                })
+
+        diets = item.get("diets_struct")
+        if diets:
+            gids = await self._resolve_reference_gids(
+                "shopify", "dietary-preferences",
+                diets, _DIET_REFERENCE_ALIASES, item,
+            )
+            if gids:
+                metafields.append({
+                    "namespace": "shopify", "key": "dietary-preferences",
+                    "type": "list.metaobject_reference", "value": json.dumps(gids),
+                })
+
+        return metafields
+
+    async def _resolve_reference_gids(
+        self, namespace: str, key: str,
+        canonical_keys: list[str], aliases: dict[str, list[str]], item: dict,
+    ) -> list[str]:
+        """Map a meal's canonical recipe flags (e.g. ['gluten', 'milk']) to the
+        destination store's standard metaobject GIDs, de-duplicated and
+        order-preserving. Returns [] when the reference map is unavailable.
+        Flags with no matching metaobject are logged once per meal, not fatal."""
+        reference_map = await self._get_reference_map(namespace, key)
+        if not reference_map:
+            return []
+        gids: list[str] = []
+        missing: list[str] = []
+        for canonical in canonical_keys:
+            gid = _match_reference(reference_map, aliases.get(canonical, [canonical]))
+            if gid:
+                gids.append(gid)
+            else:
+                missing.append(canonical)
+        if missing:
+            logger.warning(
+                f"[load] meal '{item.get('name')}': no {namespace}.{key} "
+                f"metaobject for {missing}; those values are omitted"
+            )
+        seen: set[str] = set()
+        return [g for g in gids if not (g in seen or seen.add(g))]
+
+    async def _get_reference_map(self, namespace: str, key: str) -> dict[str, str]:
+        """Resolve and cache {normalized-handle/name → metaobject GID} for a
+        native reference metafield. Returns {} (and logs once) when the backing
+        metaobjects can't be read — the native metafield is then skipped for the
+        whole run rather than retried per meal."""
+        cache_key = (namespace, key)
+        if cache_key in self._reference_maps:
+            return self._reference_maps[cache_key]
+
+        result: dict[str, str] = {}
+        try:
+            result = await self._resolve_reference_map(namespace, key)
+        except Exception as exc:
+            logger.warning(
+                f"[load] native metafield {namespace}.{key}: failed to resolve "
+                f"metaobjects: {exc}"
+            )
+
+        if not result and cache_key not in self._ref_map_warned:
+            self._ref_map_warned.add(cache_key)
+            logger.warning(
+                f"[load] native metafield {namespace}.{key}: no metaobject "
+                f"entries resolved — definition not enabled or the app lacks the "
+                f"`read_metaobjects` scope. Skipping native writes for this "
+                f"metafield; grant the scope to populate it."
+            )
+
+        self._reference_maps[cache_key] = result
+        return result
+
+    async def _resolve_reference_map(self, namespace: str, key: str) -> dict[str, str]:
+        """Walk metafield-definition → metaobject-definition → metaobject entries
+        and build {normalized handle/displayName → GID}. Each step degrades to an
+        empty map when a hop is unreadable (so the caller skips natives)."""
+        data = await self.dest.graphql(
+            _GQL_GET_METAFIELD_DEFINITION,
+            variables={"namespace": namespace, "key": key},
+            estimated_cost=10,
+        )
+        edges = (data.get("metafieldDefinitions") or {}).get("edges") or []
+        if not edges:
+            return {}
+        validations = edges[0]["node"].get("validations") or []
+        mo_def_id = next(
+            (v.get("value") for v in validations
+             if v.get("name") == "metaobject_definition_id"),
+            None,
+        )
+        if not mo_def_id:
+            return {}
+
+        def_data = await self.dest.graphql(
+            _GQL_GET_METAOBJECT_DEFINITION,
+            variables={"id": mo_def_id}, estimated_cost=5,
+        )
+        mo_def = def_data.get("metaobjectDefinition")
+        if not mo_def or not mo_def.get("type"):
+            return {}
+        mo_type = mo_def["type"]
+
+        result: dict[str, str] = {}
+        cursor: Optional[str] = None
+        while True:
+            page = await self.dest.graphql(
+                _GQL_LIST_METAOBJECTS,
+                variables={"type": mo_type, "cursor": cursor},
+                estimated_cost=250,
+            )
+            conn = page.get("metaobjects") or {}
+            for edge in conn.get("edges", []):
+                node = edge["node"]
+                gid = node["id"]
+                handle = _normalize_reference_token(node.get("handle") or "")
+                if handle:
+                    result[handle] = gid
+                name = _normalize_reference_token(node.get("displayName") or "")
+                if name:
+                    result.setdefault(name, gid)
+            page_info = conn.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+        return result
+
+    async def _write_metafields(
+        self, product_gid: str, changes: list[dict], title: str,
+    ) -> None:
+        """Upsert the given metafields on a product via a single `metafieldsSet`
+        (idempotent by namespace+key). Per-product failures are logged, not
+        raised — metafields are enrichment, never a reason to fail a meal."""
+        if not changes:
+            return
+        payload = [
+            {
+                "ownerId": product_gid,
+                "namespace": mf["namespace"],
+                "key": mf["key"],
+                "type": mf["type"],
+                "value": mf["value"],
+            }
+            for mf in changes
+        ]
+        try:
+            data = await self.dest.graphql(
+                _GQL_METAFIELDS_SET,
+                variables={"metafields": payload}, estimated_cost=50,
+            )
+            errors = (data.get("metafieldsSet") or {}).get("userErrors") or []
+            if errors:
+                logger.warning(
+                    f"[load] meal '{title}': metafieldsSet userErrors: {errors}"
+                )
+            else:
+                logger.info(
+                    f"[load] meal '{title}': wrote {len(changes)} metafield(s): "
+                    f"{sorted(m['namespace'] + '.' + m['key'] for m in changes)}"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"[load] meal '{title}': failed to write metafields: {exc}"
             )
 
     # ── PUBLICATIONS ─────────────────────────────────────────────────────────

@@ -7,11 +7,14 @@ from unittest.mock import AsyncMock
 import pytest
 
 from migration.django_db import (
+    _build_cooking,
+    _build_recipe_flags,
     _build_tags,
     _build_variants,
     _extract_locale,
     _format_price,
     _is_active_today,
+    _meal_type_tag,
     _parse_diet_flags,
     _percent_encode_url,
     _plan_label,
@@ -22,12 +25,18 @@ from migration.django_db import (
 from migration.id_map import IDMap
 from migration.resources.meals import (
     MealsResource,
+    _build_managed_metafields,
+    _canonical_metafield_value,
     _diff_images,
+    _diff_metafields,
     _diff_product,
     _diff_publications,
     _escape_for_query,
+    _match_reference,
     _needs_subscription_association,
     _needs_tracking_disable,
+    _normalize_reference_token,
+    _nutrition_payload,
     _parse_image_sources,
     _parse_tags_csv,
     _serialize_image_sources,
@@ -110,10 +119,14 @@ def _existing_node(
     publications: dict[str, bool] | None = None,
     selling_plan_group_ids: list[str] | None = None,
     category_gid: str | None = None,
+    managed_metafields: dict[str, str] | None = None,
 ) -> dict:
     """Build a Shopify-shaped product node for `getProductById` / `findByTitle`
     responses. If `payload` is given, fields default to values that produce
-    NO diff against that payload; pass overrides to introduce intentional drift."""
+    NO diff against that payload; pass overrides to introduce intentional drift.
+
+    `managed_metafields` maps 'namespace.key' → raw value string for the managed
+    metafield aliases (fresheo.*/shopify.*); absent keys come back as None."""
     payload = payload or {}
 
     final_title = payload.get("title", "") if title is None else title
@@ -179,6 +192,18 @@ def _existing_node(
             for img in final_image_ids
         ]},
         "metafield": {"value": metafield_value} if metafield_value else None,
+        **{
+            alias: ({"value": (managed_metafields or {}).get(full_key)}
+                    if (managed_metafields or {}).get(full_key) is not None else None)
+            for alias, full_key in (
+                ("mf_nutri_score", "fresheo.nutri_score"),
+                ("mf_nutrition", "fresheo.nutrition"),
+                ("mf_cooking", "fresheo.cooking_instructions"),
+                ("mf_author", "fresheo.author"),
+                ("mf_allergens", "shopify.allergen-information"),
+                ("mf_diets", "shopify.dietary-preferences"),
+            )
+        },
         "resourcePublicationsV2": {"edges": [
             {"node": {"publication": {"id": gid}, "isPublished": pub}}
             for gid, pub in final_publications.items()
@@ -195,6 +220,9 @@ def _smart_graphql(
     selling_plan_group_response=None,
     get_product_response=None,
     products_by_tag_edges=None,
+    metafield_definition_response=None,
+    metaobject_definition_response=None,
+    metaobjects_response=None,
 ):
     """Build a graphql side_effect that routes by query string. Handles the
     queries MealsResource issues per meal: listPublications, title-search,
@@ -245,6 +273,19 @@ def _smart_graphql(
                     "category": {"id": product.get("category")},
                 },
                 "userErrors": [],
+            }}
+        if "setMetafields" in query or "metafieldsSet" in query:
+            return {"metafieldsSet": {"metafields": [], "userErrors": []}}
+        if "mfDef" in query:
+            # Default: no definition → native reference metafields are skipped.
+            return metafield_definition_response or {
+                "metafieldDefinitions": {"edges": []}
+            }
+        if "moDef" in query:
+            return metaobject_definition_response or {"metaobjectDefinition": None}
+        if "moList" in query:
+            return metaobjects_response or {"metaobjects": {
+                "edges": [], "pageInfo": {"hasNextPage": False, "endCursor": None},
             }}
         if "getProductById" in query:
             return {"product": get_product_response}
@@ -1664,6 +1705,14 @@ class TestMealsLoad:
             sample_meal.get("image_urls") or []
             if image_sources is None else image_sources
         )
+        # Mirror the managed metafields the resource would write, so an
+        # otherwise-unchanged meal produces an empty metafield diff. Native
+        # shopify.* references aren't included (sample_meal has no structured
+        # recipe data, and the resolver is a no-op without read_metaobjects).
+        managed = {
+            f"{mf['namespace']}.{mf['key']}": mf["value"]
+            for mf in _build_managed_metafields(sample_meal)
+        }
         return _existing_node(
             payload=payload,
             image_sources=srcs,
@@ -1671,6 +1720,7 @@ class TestMealsLoad:
                           "gid://shopify/Publication/2": True},
             selling_plan_group_ids=["gid://shopify/SellingPlanGroup/500"],
             category_gid=sample_meal.get("category_gid"),
+            managed_metafields=managed,
         )
 
     async def test_unchanged_meal_makes_no_writes(
@@ -2230,3 +2280,309 @@ class TestMealsLoad:
         assert len(adds) == 1
         # Product body unchanged → no PUT.
         mock_dest_client.put.assert_not_awaited()
+
+
+# ── Metafield builders (django_db) ────────────────────────────────────────────
+
+
+class TestBuildCooking:
+    def test_microwave_and_oven(self):
+        row = {"cold_meal": False, "microwave_cooking_power": 900,
+               "microwave_cooking_time": "3 min 30",
+               "oven_cooking_temp": 175, "oven_cooking_time": "12 min"}
+        assert _build_cooking(row) == {
+            "cold": False,
+            "microwave": {"power_w": 900, "time": "3 min 30"},
+            "oven": {"temp_c": 175, "time": "12 min"},
+        }
+
+    def test_cold_meal_without_heating(self):
+        row = {"cold_meal": True, "microwave_cooking_power": 0,
+               "microwave_cooking_time": "", "oven_cooking_temp": 0,
+               "oven_cooking_time": ""}
+        assert _build_cooking(row) == {"cold": True}
+
+    def test_nothing_to_say_returns_none(self):
+        row = {"cold_meal": False, "microwave_cooking_power": 0,
+               "microwave_cooking_time": "", "oven_cooking_temp": 0,
+               "oven_cooking_time": ""}
+        assert _build_cooking(row) is None
+
+    def test_microwave_only_omits_oven(self):
+        row = {"cold_meal": False, "microwave_cooking_power": 800,
+               "microwave_cooking_time": "4 min", "oven_cooking_temp": 0,
+               "oven_cooking_time": ""}
+        cooking = _build_cooking(row)
+        assert cooking == {"cold": False,
+                           "microwave": {"power_w": 800, "time": "4 min"}}
+
+
+class TestBuildRecipeFlags:
+    def test_none_when_no_recipe(self):
+        assert _build_recipe_flags({"recipe_id": None}, ["gluten"], "allergen_") is None
+
+    def test_collects_truthy_columns_in_order(self):
+        row = {"recipe_id": 5, "allergen_gluten": True, "allergen_milk": True,
+               "allergen_eggs": False}
+        assert _build_recipe_flags(
+            row, ["gluten", "eggs", "milk"], "allergen_"
+        ) == ["gluten", "milk"]
+
+    def test_recipe_with_no_flags_is_empty_list_not_none(self):
+        # Recipe exists but flags all false → [] (distinguished from None).
+        row = {"recipe_id": 5, "allergen_gluten": False}
+        assert _build_recipe_flags(row, ["gluten"], "allergen_") == []
+
+
+class TestMealTypeTag:
+    def test_slugifies_with_menu_prefix(self):
+        assert _meal_type_tag("Végétarien Gourmand") == "menu-vegetarien-gourmand"
+
+    def test_empty_returns_none(self):
+        assert _meal_type_tag("") is None
+        assert _meal_type_tag(None) is None  # type: ignore[arg-type]
+
+
+class TestBuildTagsMealType:
+    def _diets(self) -> dict[str, bool]:
+        return {s: False for s in [
+            "vegetarien", "vegan", "sans-gluten", "sans-lactose",
+            "sans-porc", "meat", "fish", "fitness",
+        ]}
+
+    def test_meal_type_tag_included(self):
+        tags = _build_tags(diets=self._diets(), is_active_today=False,
+                           category=None, nutri_score=None, meal_type="Fitness")
+        assert "menu-fitness" in tags
+
+    def test_no_meal_type_no_menu_tag(self):
+        tags = _build_tags(diets=self._diets(), is_active_today=False,
+                           category=None, nutri_score=None)
+        assert not any(t.startswith("menu-") for t in tags)
+
+
+# ── Metafield helpers (meals) ─────────────────────────────────────────────────
+
+
+class TestNutritionPayload:
+    def test_builds_from_macros(self):
+        payload = _nutrition_payload(
+            {"kilo_calories": 254, "proteins": 32.5, "weight": 450}
+        )
+        assert payload["kilo_calories"] == 254
+        assert payload["proteins"] == 32.5
+        assert payload["weight"] == 450
+        assert payload["salts"] is None  # absent macro present as None
+
+    def test_all_zero_or_missing_returns_none(self):
+        assert _nutrition_payload({}) is None
+        assert _nutrition_payload({"kilo_calories": 0, "proteins": 0}) is None
+
+
+class TestBuildManagedMetafields:
+    def test_nutri_and_nutrition_present(self):
+        mfs = _build_managed_metafields(
+            {"nutri_score": "A", "kilo_calories": 254, "proteins": 30}
+        )
+        keys = {(m["namespace"], m["key"]) for m in mfs}
+        assert ("fresheo", "nutri_score") in keys
+        assert ("fresheo", "nutrition") in keys
+
+    def test_cooking_and_author_when_present(self):
+        mfs = {m["key"]: m for m in _build_managed_metafields(
+            {"nutri_score": "B", "cooking": {"cold": True}, "author": "gusto"}
+        )}
+        assert mfs["cooking_instructions"]["type"] == "json"
+        assert mfs["author"]["value"] == "gusto"
+
+    def test_blank_sources_skipped(self):
+        keys = {m["key"] for m in _build_managed_metafields(
+            {"nutri_score": "", "author": "  ", "cooking": None}
+        )}
+        assert keys == set()
+
+
+class TestCanonicalMetafieldValue:
+    def test_json_key_order_insensitive(self):
+        assert (
+            _canonical_metafield_value('{"b":1,"a":2}', "json")
+            == _canonical_metafield_value('{"a":2,"b":1}', "json")
+        )
+
+    def test_reference_list_order_insensitive(self):
+        assert (
+            _canonical_metafield_value('["gid://x/2","gid://x/1"]',
+                                       "list.metaobject_reference")
+            == _canonical_metafield_value('["gid://x/1","gid://x/2"]',
+                                          "list.metaobject_reference")
+        )
+
+    def test_text_raw_and_empty(self):
+        assert _canonical_metafield_value("A", "single_line_text_field") == "A"
+        assert _canonical_metafield_value("", "json") == ""
+        assert _canonical_metafield_value(None, "json") == ""
+
+
+class TestDiffMetafields:
+    def _mf(self, value="A", key="nutri_score", mtype="single_line_text_field"):
+        return {"namespace": "fresheo", "key": key, "type": mtype, "value": value}
+
+    def test_no_change_when_values_match(self):
+        assert _diff_metafields({"fresheo.nutri_score": "A"}, [self._mf("A")]) == []
+
+    def test_change_detected(self):
+        assert len(_diff_metafields({"fresheo.nutri_score": "B"}, [self._mf("A")])) == 1
+
+    def test_missing_existing_is_a_change(self):
+        desired = [self._mf("A")]
+        assert _diff_metafields({}, desired) == desired
+
+    def test_json_formatting_diff_ignored(self):
+        existing = {"fresheo.nutrition": '{"a": 1, "b": 2}'}
+        desired = [self._mf('{"b":2,"a":1}', key="nutrition", mtype="json")]
+        assert _diff_metafields(existing, desired) == []
+
+
+class TestMatchReference:
+    def test_matches_normalized_handle(self):
+        assert _match_reference({"tree-nuts": "gid://x/9"}, ["tree_nuts"]) == "gid://x/9"
+
+    def test_first_candidate_wins(self):
+        assert _match_reference({"dairy": "gid://x/5"}, ["milk", "dairy"]) == "gid://x/5"
+
+    def test_no_match_returns_none(self):
+        assert _match_reference({"gluten": "g"}, ["soy"]) is None
+
+
+class TestNormalizeReferenceToken:
+    def test_collapses_separators(self):
+        assert _normalize_reference_token("Tree Nuts") == "tree-nuts"
+        assert _normalize_reference_token("tree_nuts") == "tree-nuts"
+        assert _normalize_reference_token("tree-nuts") == "tree-nuts"
+
+
+# ── Metafield sync (integration) ──────────────────────────────────────────────
+
+
+class TestMealMetafieldSync:
+    async def test_create_writes_managed_metafields(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql())
+        mock_dest_client.post = AsyncMock(return_value={"product": {"id": 9001}})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        set_calls = [
+            c for c in mock_dest_client.graphql.await_args_list
+            if "setMetafields" in c.args[0]
+        ]
+        assert len(set_calls) == 1
+        sent = set_calls[0].kwargs["variables"]["metafields"]
+        keys = {(m["namespace"], m["key"]) for m in sent}
+        assert ("fresheo", "nutri_score") in keys
+        assert ("fresheo", "nutrition") in keys
+        assert all(m["ownerId"] == "gid://shopify/Product/9001" for m in sent)
+
+    async def test_unchanged_metafields_skip_write(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # All managed metafields already match → no metafieldsSet on update.
+        existing = await TestMealsLoad()._matching_existing(sample_meal)
+        mock_dest_client.get = AsyncMock(return_value={"products": [{
+            "id": 9001, "admin_graphql_api_id": "gid://shopify/Product/9001",
+            "title": sample_meal["name"], "handle": _slugify(sample_meal["name"]),
+        }]})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            get_product_response=existing,
+        ))
+        mock_dest_client.put = AsyncMock(return_value={})
+        mock_dest_client.delete = AsyncMock(return_value=None)
+        mock_dest_client.post = AsyncMock(return_value={})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        assert not any(
+            "setMetafields" in c.args[0]
+            for c in mock_dest_client.graphql.await_args_list
+        )
+
+    async def test_native_allergens_resolved_when_scope_present(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # Structured recipe allergens + a readable reference map → the native
+        # shopify.allergen-information metafield is written with metaobject GIDs.
+        sample_meal["allergens_struct"] = ["gluten", "milk"]
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            metafield_definition_response={"metafieldDefinitions": {"edges": [
+                {"node": {"id": "gid://shopify/MetafieldDefinition/1",
+                          "validations": [{"name": "metaobject_definition_id",
+                                           "value": "gid://shopify/MetaobjectDefinition/100"}]}},
+            ]}},
+            metaobject_definition_response={"metaobjectDefinition": {"type": "shopify--allergen"}},
+            metaobjects_response={"metaobjects": {
+                "edges": [
+                    {"node": {"id": "gid://shopify/Metaobject/11",
+                              "handle": "gluten", "displayName": "Gluten"}},
+                    {"node": {"id": "gid://shopify/Metaobject/12",
+                              "handle": "milk", "displayName": "Milk"}},
+                ],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }},
+        ))
+        mock_dest_client.post = AsyncMock(return_value={"product": {"id": 9001}})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        set_calls = [
+            c for c in mock_dest_client.graphql.await_args_list
+            if "setMetafields" in c.args[0]
+        ]
+        assert len(set_calls) == 1
+        sent = {(m["namespace"], m["key"]): m for m in set_calls[0].kwargs["variables"]["metafields"]}
+        allergen_mf = sent[("shopify", "allergen-information")]
+        assert allergen_mf["type"] == "list.metaobject_reference"
+        assert json.loads(allergen_mf["value"]) == [
+            "gid://shopify/Metaobject/11", "gid://shopify/Metaobject/12",
+        ]
+
+    async def test_native_allergens_skipped_without_scope(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # Structured allergens present but the reference metafield definition
+        # isn't readable (default _smart_graphql) → native metafield is omitted,
+        # plain fresheo.* metafields still written.
+        sample_meal["allergens_struct"] = ["gluten", "milk"]
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql())
+        mock_dest_client.post = AsyncMock(return_value={"product": {"id": 9001}})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        set_calls = [
+            c for c in mock_dest_client.graphql.await_args_list
+            if "setMetafields" in c.args[0]
+        ]
+        assert len(set_calls) == 1
+        keys = {(m["namespace"], m["key"])
+                for m in set_calls[0].kwargs["variables"]["metafields"]}
+        assert ("shopify", "allergen-information") not in keys
+        assert ("fresheo", "nutri_score") in keys

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from datetime import date
 from typing import Optional
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
@@ -29,6 +30,53 @@ SELECT
     m.unit_price                        AS unit_price,
     m.extra_price                       AS extra_price,
 
+    -- Cooking instructions (→ fresheo.cooking_instructions metafield). Fully
+    -- populated across the catalogue. `cold_meal` gates whether cooking even
+    -- applies. ean13_normale / ean13_grande are deliberately NOT selected:
+    -- they're empty strings for ~99% of meals (no real barcodes in the DB), so
+    -- there's nothing to map onto a variant barcode yet.
+    m.microwave_cooking_power           AS microwave_cooking_power,
+    m.microwave_cooking_time            AS microwave_cooking_time,
+    m.oven_cooking_temp                 AS oven_cooking_temp,
+    m.oven_cooking_time                 AS oven_cooking_time,
+    m.cold_meal                         AS cold_meal,
+    -- Chef/author (→ fresheo.author). Sparse (~15% of meals); emitted only
+    -- when non-empty. consumption_delta (shelf life) is intentionally omitted:
+    -- it's a constant 7 days for every meal, so a per-product field adds noise.
+    m.author                            AS author,
+    -- Menu category for collection/tag grouping (→ `menu-<slug>` tag). Bilingual
+    -- <fr>/<nl>, extracted to the configured locale like the meal name.
+    mt.name                             AS meal_type_raw,
+    -- Structured allergens/diets live on the linked recipe
+    -- (menu_meal.recipe_id → nutrimatic_ingredient → nutrimatic_{allergens,diets}).
+    -- Only ~15% of meals have a recipe_id; recipe_id NULL ⇒ no structured data
+    -- and the build returns None (no metafield written) rather than "no allergens".
+    -- FALLBACK / future work: the free-text `m.allergens` (allergens_raw, already
+    -- selected and rendered into body_html) and the parsed `m.filter_string`
+    -- diet flags cover far more meals and can backfill these when recipe data is
+    -- absent — see _parse_diet_flags / the rendered allergen block.
+    m.recipe_id                         AS recipe_id,
+    na.gluten      AS allergen_gluten,
+    na.crustaceans AS allergen_crustaceans,
+    na.eggs        AS allergen_eggs,
+    na.sesame      AS allergen_sesame,
+    na.sulfite     AS allergen_sulfite,
+    na.lupin       AS allergen_lupin,
+    na.fish        AS allergen_fish,
+    na.peanut      AS allergen_peanut,
+    na.soy         AS allergen_soy,
+    na.milk        AS allergen_milk,
+    na.nuts        AS allergen_nuts,
+    na.celeri      AS allergen_celeri,
+    na.mustard     AS allergen_mustard,
+    na.molluscs    AS allergen_molluscs,
+    na.lactose     AS allergen_lactose,
+    nd.vegetarian   AS diet_vegetarian,
+    nd.gluten_free  AS diet_gluten_free,
+    nd.lactose_free AS diet_lactose_free,
+    nd.pork_free    AS diet_pork_free,
+    nd.paleo        AS diet_paleo,
+
     nv.weight, nv.kilo_calories, nv.proteins, nv.carbohydrates,
     nv.lipids, nv.sugars, nv.saturated, nv.fibers, nv.salts,
 
@@ -43,6 +91,10 @@ FROM menu_meal m
     ORDER BY id ASC
     LIMIT 1
     ) nv ON TRUE
+         LEFT JOIN menu_mealtype         mt ON mt.id = m.meal_type_id
+         LEFT JOIN nutrimatic_ingredient ni ON ni.id = m.recipe_id
+         LEFT JOIN nutrimatic_allergens  na ON na.id = ni.allergens_id
+         LEFT JOIN nutrimatic_diets      nd ON nd.id = ni.diets_id
 WHERE m.visible_for_customers = TRUE
   AND (m.inactive_on IS NULL OR m.inactive_on >= CURRENT_DATE)
 ORDER BY m.id;
@@ -187,13 +239,15 @@ def _build_tags(
     is_active_today: bool,
     category: Optional[str],
     nutri_score: Optional[str],
+    meal_type: Optional[str] = None,
 ) -> list[str]:
     """Sorted Shopify tags for a meal.
 
     Includes: active diet slugs from [[_parse_diet_flags]], `current-menu`
     when the meal's active window includes today, the category enum kebab-cased
-    (`MAIN_DISH` → `main-dish`), and `nutri-{a..e}`. Sorted for stable payloads
-    so re-runs produce identical CSVs and avoid no-op PUTs flagging changes.
+    (`MAIN_DISH` → `main-dish`), `nutri-{a..e}`, and a `menu-<slug>` tag from the
+    meal type for collection grouping. Sorted for stable payloads so re-runs
+    produce identical CSVs and avoid no-op PUTs flagging changes.
     """
     tags: set[str] = {slug for slug, on in (diets or {}).items() if on}
     if is_active_today:
@@ -202,6 +256,9 @@ def _build_tags(
         tags.add(category.lower().replace("_", "-"))
     if nutri_score:
         tags.add(f"nutri-{nutri_score.lower()}")
+    meal_type_tag = _meal_type_tag(meal_type or "")
+    if meal_type_tag:
+        tags.add(meal_type_tag)
     return sorted(tags)
 
 
@@ -230,6 +287,78 @@ def _parse_diet_flags(filter_string: Optional[str]) -> dict[str, bool]:
 def diet_labels_fr() -> dict[str, str]:
     """Return the French label dict used when rendering diet badges."""
     return dict(_DIET_LABELS_FR)
+
+
+# Boolean columns on nutrimatic_allergens, in a stable order. Each maps to a
+# canonical key reused as the lookup token when resolving Shopify's standard
+# allergen metaobjects (see MealsResource._ALLERGEN_REFERENCE_ALIASES).
+_ALLERGEN_COLUMNS = [
+    "gluten", "crustaceans", "eggs", "sesame", "sulfite", "lupin", "fish",
+    "peanut", "soy", "milk", "nuts", "celeri", "mustard", "molluscs", "lactose",
+]
+
+# Boolean columns on nutrimatic_diets, stable order.
+_DIET_COLUMNS = [
+    "vegetarian", "gluten_free", "lactose_free", "pork_free", "paleo",
+]
+
+
+def _build_recipe_flags(row: dict, columns: list[str], prefix: str) -> Optional[list[str]]:
+    """Collect the canonical keys whose boolean column is truthy for a meal's
+    linked recipe.
+
+    `prefix` is the column alias prefix from `_MEALS_SQL` ('allergen_' / 'diet_').
+    Returns None when the meal has no linked recipe (`recipe_id` is NULL) — that
+    distinguishes 'no structured data' (write nothing) from 'recipe says no
+    allergens' (an empty list, write an empty reference set). Only ~15% of meals
+    carry a recipe link today; the rest fall back to the free-text allergen /
+    parsed diet-flag paths documented in `_MEALS_SQL`.
+    """
+    if row.get("recipe_id") is None:
+        return None
+    return [key for key in columns if row.get(f"{prefix}{key}")]
+
+
+def _build_cooking(row: dict) -> Optional[dict]:
+    """Shape the cooking-instruction payload for the fresheo.cooking_instructions
+    metafield.
+
+    Returns {'cold': bool, 'microwave': {...}, 'oven': {...}} with the heating
+    sub-dicts present only when the meal carries that method's data. Cold meals
+    need no heating, so a cold meal with no microwave/oven data still yields
+    {'cold': True}. Returns None only when there is genuinely nothing to say
+    (not cold and no heating instructions)."""
+    cold = bool(row.get("cold_meal"))
+    cooking: dict = {"cold": cold}
+
+    mw_power = row.get("microwave_cooking_power") or 0
+    mw_time = (row.get("microwave_cooking_time") or "").strip()
+    if mw_time or mw_power:
+        cooking["microwave"] = {"power_w": mw_power, "time": mw_time}
+
+    oven_temp = row.get("oven_cooking_temp") or 0
+    oven_time = (row.get("oven_cooking_time") or "").strip()
+    if oven_time or oven_temp:
+        cooking["oven"] = {"temp_c": oven_temp, "time": oven_time}
+
+    if not cold and "microwave" not in cooking and "oven" not in cooking:
+        return None
+    return cooking
+
+
+def _meal_type_tag(label: str) -> Optional[str]:
+    """Slugify a meal-type label into a `menu-<slug>` tag for collection
+    grouping (e.g. 'Végétarien Gourmand' → 'menu-vegetarien-gourmand'). Returns
+    None for an empty label so callers can skip it."""
+    if not label:
+        return None
+    ascii_only = (
+        unicodedata.normalize("NFKD", label)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_only.lower()).strip("-")
+    return f"menu-{slug}" if slug else None
 
 
 def _is_active_today(active_on, inactive_on) -> bool:
@@ -385,6 +514,7 @@ async def fetch_meals(
         diets = _parse_diet_flags(row["filter_string"])
         nutri_score = (row["nutri_score"] or "A").upper()
         category = row.get("category")
+        meal_type = _extract_locale(row.get("meal_type_raw"), locale)
         is_active_today = _is_active_today(
             row.get("active_on"), row.get("inactive_on")
         )
@@ -425,13 +555,23 @@ async def fetch_meals(
             "category":      category,
             "category_label": category_label_fr(category),
             "category_gid":  category_taxonomy_gid(category),
+            "meal_type":     meal_type,
             "is_active_today": is_active_today,
             "tags": _build_tags(
                 diets=diets,
                 is_active_today=is_active_today,
                 category=category,
                 nutri_score=nutri_score,
+                meal_type=meal_type,
             ),
+            # Structured metafield source data. `allergens_struct` / `diets_struct`
+            # are None when the meal has no linked recipe (≈85% today) so the
+            # metafield is skipped rather than written empty; `cooking` is None
+            # only when there's nothing to say. See _MEALS_SQL for the fallbacks.
+            "allergens_struct": _build_recipe_flags(row, _ALLERGEN_COLUMNS, "allergen_"),
+            "diets_struct":     _build_recipe_flags(row, _DIET_COLUMNS, "diet_"),
+            "cooking":          _build_cooking(row),
+            "author":           (row.get("author") or "").strip(),
             "variants": variants,
             "options":  options,
         })
