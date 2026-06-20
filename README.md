@@ -58,7 +58,36 @@ DEST_CLIENT_SECRET=yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
 | Store | Scopes |
 |-------|--------|
 | Source | `read_products`, `read_inventory`, `read_collections`, `read_content`, `read_price_rules`, `read_discounts`, `read_gift_cards`, `read_files`, `read_themes`, `read_selling_plans` |
-| Destination | `write_products`, `write_inventory`, `write_collections`, `write_content`, `write_price_rules`, `write_discounts`, `write_gift_cards`, `write_files`, `write_themes`, `write_selling_plans` |
+| Destination | `write_products`, `write_inventory`, `write_collections`, `write_content`, `write_price_rules`, `write_discounts`, `write_gift_cards`, `write_files`, `write_themes`, `write_selling_plans`, `read_metaobjects` |
+
+> `read_metaobjects` is required on the destination for the native
+> `shopify.allergen-information` / `shopify.dietary-preferences` metafields:
+> the sync resolves each meal's allergen/diet flags to standard metaobject GIDs
+> before writing the reference. Without it those native metafields are skipped
+> (logged as a warning) while the `fresheo.*` metafields still sync.
+
+**Product metafield definitions (destination)**
+
+`sync-meals` writes metafield *values*; the definitions must exist on the
+destination's **Product** owner type for them to render (Settings → Custom data
+→ Products). Create the custom `fresheo.*` ones; add the standard `shopify.*`
+ones from Shopify's standard templates.
+
+| Namespace / key | Type | Source |
+|-----------------|------|--------|
+| `fresheo.nutri_score` | Single line text | Nutri-Score letter (A–E) |
+| `fresheo.nutrition` | JSON | Macros (kcal, protein, carbs, …) |
+| `fresheo.cooking_instructions` | JSON | `{cold, microwave, oven}` |
+| `fresheo.author` | Single line text | Chef name (sparse) |
+| `fresheo.diet` | List of single line text | Active diet slugs (filter_string, falling back to recipe flags; resolution-free) |
+| `fresheo.image_sources` | List of URLs | Internal bookkeeping for image diffing |
+| `shopify.dietary-preferences` | Dietary preferences (standard) | Diet flags → standard metaobjects |
+| `shopify.allergen-information` | Allergen information (standard) | Recipe allergens → standard metaobjects |
+
+> `fresheo.diet` is a plain-text mirror of the diet signal that needs no
+> metaobject resolution or `read_metaobjects` scope, so it always populates —
+> use it as a fallback for theming when the native `shopify.dietary-preferences`
+> reference isn't available.
 
 ---
 

@@ -39,6 +39,7 @@ from migration.resources.meals import (
     _nutrition_payload,
     _parse_image_sources,
     _parse_tags_csv,
+    _select_diet_source,
     _serialize_image_sources,
     _slugify,
     _variants_differ,
@@ -200,6 +201,7 @@ def _existing_node(
                 ("mf_nutrition", "fresheo.nutrition"),
                 ("mf_cooking", "fresheo.cooking_instructions"),
                 ("mf_author", "fresheo.author"),
+                ("mf_diet", "fresheo.diet"),
                 ("mf_allergens", "shopify.allergen-information"),
                 ("mf_diets", "shopify.dietary-preferences"),
             )
@@ -2401,6 +2403,29 @@ class TestBuildManagedMetafields:
         )}
         assert keys == set()
 
+    def test_diet_from_filter_string_slugs(self):
+        # Active dietary slugs are written as a sorted text list; merchandising
+        # slugs (meat) are excluded, and the value is resolution-free.
+        mfs = {m["key"]: m for m in _build_managed_metafields(
+            {"diets": {"sans-gluten": True, "vegetarien": True, "meat": True}}
+        )}
+        assert mfs["diet"]["type"] == "list.single_line_text_field"
+        assert json.loads(mfs["diet"]["value"]) == ["sans-gluten", "vegetarien"]
+
+    def test_diet_falls_back_to_recipe_struct_normalized(self):
+        # No filter_string diet → recipe struct is used, and its English keys
+        # are folded onto the same canonical slugs as the filter_string path.
+        mfs = {m["key"]: m for m in _build_managed_metafields(
+            {"diets": {"meat": True}, "diets_struct": ["vegetarian", "gluten_free"]}
+        )}
+        assert json.loads(mfs["diet"]["value"]) == ["sans-gluten", "vegetarien"]
+
+    def test_diet_absent_when_no_dietary_slug(self):
+        keys = {m["key"] for m in _build_managed_metafields(
+            {"diets": {"meat": True, "fish": True}}
+        )}
+        assert "diet" not in keys
+
 
 class TestCanonicalMetafieldValue:
     def test_json_key_order_insensitive(self):
@@ -2461,6 +2486,37 @@ class TestNormalizeReferenceToken:
         assert _normalize_reference_token("tree-nuts") == "tree-nuts"
 
 
+class TestSelectDietSource:
+    def test_prefers_filter_string_flags(self):
+        # filter_string slugs win even when recipe flags are also present.
+        keys, aliases = _select_diet_source({
+            "diets": {"sans-gluten": True, "vegetarien": True, "meat": True},
+            "diets_struct": ["pork_free"],
+        })
+        assert keys == ["vegetarien", "sans-gluten"]
+        assert aliases["sans-gluten"] == ["gluten-free", "gluten-free-diet"]
+
+    def test_omits_non_diet_slugs(self):
+        # meat / fish / fitness are merchandising flags, not dietary preferences.
+        keys, _ = _select_diet_source({
+            "diets": {"meat": True, "fish": True, "fitness": True},
+        })
+        assert keys == []
+
+    def test_falls_back_to_recipe_struct(self):
+        # No filter_string diet → use the structured recipe flags.
+        keys, aliases = _select_diet_source({
+            "diets": {"meat": True},
+            "diets_struct": ["vegetarian", "gluten_free"],
+        })
+        assert keys == ["vegetarian", "gluten_free"]
+        assert aliases["gluten_free"] == ["gluten-free", "gluten-free-diet"]
+
+    def test_empty_when_no_source(self):
+        assert _select_diet_source({"diets": {}, "diets_struct": None}) == ([], {})
+        assert _select_diet_source({}) == ([], {})
+
+
 # ── Metafield sync (integration) ──────────────────────────────────────────────
 
 
@@ -2483,11 +2539,13 @@ class TestMealMetafieldSync:
             if "setMetafields" in c.args[0]
         ]
         assert len(set_calls) == 1
-        sent = set_calls[0].kwargs["variables"]["metafields"]
-        keys = {(m["namespace"], m["key"]) for m in sent}
-        assert ("fresheo", "nutri_score") in keys
-        assert ("fresheo", "nutrition") in keys
-        assert all(m["ownerId"] == "gid://shopify/Product/9001" for m in sent)
+        sent = {(m["namespace"], m["key"]): m for m in set_calls[0].kwargs["variables"]["metafields"]}
+        assert ("fresheo", "nutri_score") in sent
+        assert ("fresheo", "nutrition") in sent
+        # Resolution-free diet text mirror — sample_meal has sans-gluten active.
+        assert json.loads(sent[("fresheo", "diet")]["value"]) == ["sans-gluten"]
+        assert all(m["ownerId"] == "gid://shopify/Product/9001"
+                   for m in set_calls[0].kwargs["variables"]["metafields"])
 
     async def test_unchanged_metafields_skip_write(
         self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
@@ -2586,3 +2644,48 @@ class TestMealMetafieldSync:
                 for m in set_calls[0].kwargs["variables"]["metafields"]}
         assert ("shopify", "allergen-information") not in keys
         assert ("fresheo", "nutri_score") in keys
+
+    async def test_native_diets_resolved_from_filter_string(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # The diet metafield is sourced from filter_string flags (item['diets']),
+        # not the recipe struct. sample_meal has no diets_struct, yet its
+        # `sans-gluten` filter flag resolves to the gluten-free metaobject.
+        sample_meal["diets_struct"] = None
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            metafield_definition_response={"metafieldDefinitions": {"edges": [
+                {"node": {"id": "gid://shopify/MetafieldDefinition/2",
+                          "validations": [{"name": "metaobject_definition_id",
+                                           "value": "gid://shopify/MetaobjectDefinition/200"}]}},
+            ]}},
+            metaobject_definition_response={"metaobjectDefinition": {"type": "shopify--dietary-preference"}},
+            metaobjects_response={"metaobjects": {
+                "edges": [
+                    {"node": {"id": "gid://shopify/Metaobject/21",
+                              "handle": "gluten-free", "displayName": "Gluten-free"}},
+                    {"node": {"id": "gid://shopify/Metaobject/22",
+                              "handle": "vegan", "displayName": "Vegan"}},
+                ],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }},
+        ))
+        mock_dest_client.post = AsyncMock(return_value={"product": {"id": 9001}})
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        set_calls = [
+            c for c in mock_dest_client.graphql.await_args_list
+            if "setMetafields" in c.args[0]
+        ]
+        assert len(set_calls) == 1
+        sent = {(m["namespace"], m["key"]): m
+                for m in set_calls[0].kwargs["variables"]["metafields"]}
+        diet_mf = sent[("shopify", "dietary-preferences")]
+        assert diet_mf["type"] == "list.metaobject_reference"
+        # Only sans-gluten matches; meat is omitted (not a dietary preference).
+        assert json.loads(diet_mf["value"]) == ["gid://shopify/Metaobject/21"]
