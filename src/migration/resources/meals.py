@@ -377,11 +377,15 @@ def _diff_product(existing: dict, payload: dict) -> dict:
     Comparisons:
       - title / body_html / product_type: string equality.
       - tags: CSV set equality (order/whitespace insensitive).
-      - variants: keyed by sku on (price, option1); any mismatch emits the full
-        new variants list. Inventory tracking is intentionally NOT compared
-        here — it's handled out-of-band via GraphQL (see
-        [[_needs_tracking_disable]] / [[MealsResource._disable_inventory_tracking]])
-        because the REST inventory_management field was removed in API 2024-04.
+      - variants: keyed by sku on option1 only; any mismatch (a SKU added,
+        removed, or its size label changed) emits the full new variants list,
+        with existing SKUs' prices preserved (see [[_merge_variant_prices]]).
+        Price is NOT compared and never re-pushed on its own: after the initial
+        load the Shopify team owns prices, so a price-only change must not
+        trigger a write. Inventory tracking is likewise NOT compared here — it's
+        handled out-of-band via GraphQL (see [[_needs_tracking_disable]] /
+        [[MealsResource._disable_inventory_tracking]]) because the REST
+        inventory_management field was removed in API 2024-04.
       - options: [(name, sorted(values))] tuple equality; any mismatch emits
         the full new options list.
     """
@@ -399,7 +403,9 @@ def _diff_product(existing: dict, payload: dict) -> dict:
         changed["tags"] = payload.get("tags", "")
 
     if _variants_differ(existing.get("variants") or [], payload.get("variants") or []):
-        changed["variants"] = payload.get("variants", [])
+        changed["variants"] = _merge_variant_prices(
+            existing.get("variants") or [], payload.get("variants") or []
+        )
 
     # Only diff options when the payload carries some. Single-variant
     # categories (DESSERT, DRINKS, …) send no `options`; Shopify will keep
@@ -413,21 +419,47 @@ def _diff_product(existing: dict, payload: dict) -> dict:
 
 
 def _variants_differ(existing: list[dict], new: list[dict]) -> bool:
-    """Variants are 'equal' when keyed-by-SKU dicts match on price and option1.
+    """Variants are 'equal' when keyed-by-SKU dicts match on option1.
     SKU is the stable cross-run key the migrator sets deterministically in
-    [[_build_variants]]. Inventory tracking is excluded on purpose: a tracking
-    mismatch must not trigger a full variant replacement (that would churn
-    variant IDs and break variant↔image links) — it's reconciled separately via
+    [[_build_variants]].
+
+    Price is deliberately excluded: after the initial load the Shopify team owns
+    prices, so a price-only change must not flag a difference (which would PUT
+    the whole variant list and clobber their value). Only a structural change —
+    a SKU added/removed, or its size label (option1) changed — is a real
+    difference; when one occurs, [[_merge_variant_prices]] carries the existing
+    prices forward so the replacement still leaves manual prices intact.
+
+    Inventory tracking is excluded on purpose too: a tracking mismatch must not
+    trigger a full variant replacement (that would churn variant IDs and break
+    variant↔image links) — it's reconciled separately via
     [[_needs_tracking_disable]] and a GraphQL productVariantsBulkUpdate."""
-    def by_sku(items: list[dict]) -> dict[str, tuple]:
-        return {
-            (v.get("sku") or ""): (
-                v.get("price"),
-                v.get("option1"),
-            )
-            for v in items
-        }
+    def by_sku(items: list[dict]) -> dict[str, Optional[str]]:
+        return {(v.get("sku") or ""): v.get("option1") for v in items}
     return by_sku(existing) != by_sku(new)
+
+
+def _merge_variant_prices(existing: list[dict], new: list[dict]) -> list[dict]:
+    """Return the freshly-built `new` variants with each price replaced by the
+    live Shopify price for the same SKU, when that SKU already exists. Brand-new
+    SKUs keep their DB-derived price.
+
+    Used when a structural change forces a full variant replacement (see
+    [[_diff_product]]): the replacement must not reset prices the Shopify team
+    set after the initial load, so existing SKUs' prices are preserved and only
+    genuinely new variants are priced from the DB."""
+    old_price_by_sku = {
+        (v.get("sku") or ""): v.get("price")
+        for v in existing
+        if v.get("price") is not None
+    }
+    merged: list[dict] = []
+    for variant in new:
+        sku = variant.get("sku") or ""
+        if sku in old_price_by_sku:
+            variant = {**variant, "price": old_price_by_sku[sku]}
+        merged.append(variant)
+    return merged
 
 
 def _needs_tracking_disable(existing_variants: list[dict]) -> bool:

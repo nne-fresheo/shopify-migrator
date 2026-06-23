@@ -33,6 +33,7 @@ from migration.resources.meals import (
     _diff_publications,
     _escape_for_query,
     _match_reference,
+    _merge_variant_prices,
     _needs_subscription_association,
     _needs_tracking_disable,
     _normalize_reference_token,
@@ -930,18 +931,31 @@ class TestDiffProduct:
         diff = _diff_product(existing, self._payload())
         assert diff == {"tags": "a, b, c"}
 
-    def test_variant_price_change_emits_full_variant_list(self):
+    def test_variant_price_only_change_is_frozen(self):
+        # After the initial load the Shopify team owns prices: a price-only
+        # change must NOT emit a variants diff (no PUT), so their value sticks.
         existing = self._matching_existing()
         existing["variants"][0]["price"] = "8.50"
-        diff = _diff_product(existing, self._payload())
-        assert "variants" in diff
-        assert len(diff["variants"]) == 2
+        assert "variants" not in _diff_product(existing, self._payload())
 
     def test_added_variant_triggers_diff(self):
         existing = self._matching_existing()
         existing["variants"] = existing["variants"][:1]  # drop Large
         diff = _diff_product(existing, self._payload())
         assert "variants" in diff
+
+    def test_structural_change_preserves_existing_prices(self):
+        # A new SKU appears (Large), and the existing SKU's manual price has
+        # drifted from the DB value. The replacement must keep the manual price
+        # for the existing SKU and use the DB price only for the new one.
+        existing = self._matching_existing()
+        existing["variants"] = existing["variants"][:1]  # only Standard exists
+        existing["variants"][0]["price"] = "8.50"        # team-set price
+        diff = _diff_product(existing, self._payload())
+        assert "variants" in diff
+        by_sku = {v["sku"]: v["price"] for v in diff["variants"]}
+        assert by_sku["fresheo-42-1"] == "8.50"   # preserved, not DB's 9.50
+        assert by_sku["fresheo-42-2"] == "11.50"  # new SKU → DB price
 
     def test_options_order_insensitive(self):
         existing = self._matching_existing()
@@ -968,7 +982,7 @@ class TestDiffProduct:
 
 
 class TestVariantsDiffer:
-    def test_equal_on_price_and_option(self):
+    def test_equal_on_option(self):
         a = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
         b = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
         assert _variants_differ(a, b) is False
@@ -982,10 +996,46 @@ class TestVariantsDiffer:
         new = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
         assert _variants_differ(existing, new) is False
 
-    def test_price_change_differs(self):
+    def test_price_change_alone_does_not_differ(self):
+        # Prices are frozen after the initial load — a price-only drift must not
+        # flag a difference, otherwise the variant PUT would clobber the
+        # Shopify-team-managed value.
         existing = [{"sku": "x", "price": "8.00", "option1": "Standard"}]
         new = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
+        assert _variants_differ(existing, new) is False
+
+    def test_added_sku_differs(self):
+        existing = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
+        new = [{"sku": "x", "price": "9.50", "option1": "Standard"},
+               {"sku": "y", "price": "11.50", "option1": "Large"}]
         assert _variants_differ(existing, new) is True
+
+    def test_option_label_change_differs(self):
+        existing = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
+        new = [{"sku": "x", "price": "9.50", "option1": "Regular"}]
+        assert _variants_differ(existing, new) is True
+
+
+class TestMergeVariantPrices:
+    def test_existing_sku_price_preserved(self):
+        existing = [{"sku": "x", "price": "8.00", "option1": "Standard"}]
+        new = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
+        merged = _merge_variant_prices(existing, new)
+        assert merged[0]["price"] == "8.00"
+
+    def test_new_sku_keeps_db_price(self):
+        existing = [{"sku": "x", "price": "8.00", "option1": "Standard"}]
+        new = [{"sku": "x", "price": "9.50", "option1": "Standard"},
+               {"sku": "y", "price": "11.50", "option1": "Large"}]
+        merged = _merge_variant_prices(existing, new)
+        by_sku = {v["sku"]: v["price"] for v in merged}
+        assert by_sku == {"x": "8.00", "y": "11.50"}
+
+    def test_does_not_mutate_input(self):
+        existing = [{"sku": "x", "price": "8.00", "option1": "Standard"}]
+        new = [{"sku": "x", "price": "9.50", "option1": "Standard"}]
+        _merge_variant_prices(existing, new)
+        assert new[0]["price"] == "9.50"
 
 
 class TestNeedsTrackingDisable:
@@ -2219,9 +2269,12 @@ class TestMealsLoad:
         existing = await self._matching_existing(
             sample_meal, image_sources=["https://cdn.example.com/old.jpg"],
         )
-        # Force a variant diff by giving existing stale variant prices.
+        # Force a variant diff with a STRUCTURAL change (the size label drifted):
+        # a price-only change no longer triggers a replacement now that prices
+        # are frozen, so flip option1 to make `_variants_differ` fire.
         for v in existing["variants"]["edges"]:
-            v["node"]["price"] = "0.01"
+            for opt in v["node"]["selectedOptions"]:
+                opt["value"] = "Old " + opt["value"]
         existing["images"] = {"edges": [
             {"node": {"id": "gid://shopify/ProductImage/111"}},
         ]}
