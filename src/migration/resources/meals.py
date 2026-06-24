@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 # products that are no longer active by [[MealsResource._reconcile_current_menu_tags]].
 _CURRENT_MENU_TAG = "current-menu"
 
+# Shopify `vendor` stamped on every meal product (see [[MealsResource.transform]]).
+# Used to scope the one-time backfill sweep to meal products only.
+_MEAL_VENDOR = "Fresheo"
+
 
 def _slugify(title: str) -> str:
     """Deterministic Shopify-compatible handle. Same input → same handle every
@@ -492,6 +496,20 @@ def _diff_images(existing_sources: list[str], new_sources: list[str]) -> bool:
     return set(existing_sources or []) != set(new_sources or [])
 
 
+def _publications_from_node(node: dict) -> dict[str, bool]:
+    """Project a product node's `resourcePublicationsV2` edges into a
+    {publication_gid -> isPublished} dict. Shared by
+    [[MealsResource._normalize_graphql_node]] (full diff shape) and
+    [[MealsResource._fetch_products_tagged]] (reconciliation sweep)."""
+    publications: dict[str, bool] = {}
+    for e in (node.get("resourcePublicationsV2", {}) or {}).get("edges", []):
+        pub = e.get("node") or {}
+        pub_gid = (pub.get("publication") or {}).get("id")
+        if pub_gid:
+            publications[pub_gid] = bool(pub.get("isPublished"))
+    return publications
+
+
 def _diff_publications(
     existing: dict[str, bool],
     all_pub_gids: list[str],
@@ -593,7 +611,12 @@ mutation setCategory($product: ProductUpdateInput!) {
 _GQL_PRODUCTS_BY_TAG = """
 query productsByTag($query: String!, $cursor: String) {
   products(first: 250, query: $query, after: $cursor) {
-    edges { node { id legacyResourceId title tags } }
+    edges { node {
+      id legacyResourceId title tags
+      resourcePublicationsV2(first: 50) {
+        edges { node { publication { id } isPublished } }
+      }
+    } }
     pageInfo { hasNextPage endCursor }
   }
 }
@@ -740,9 +763,15 @@ class MealsResource(BaseResource):
         stale = [p for p in tagged if p["legacyResourceId"] not in keep_ids]
 
         if self.dry_run:
+            pub_gids = await self._get_publication_gids()
+            would_unpublish = sum(
+                1 for p in stale
+                if _diff_publications(p.get("publications") or {}, pub_gids, False)
+            )
             logger.info(
                 f"[DRY RUN][reconcile] {len(tagged)} product(s) tagged "
-                f"'{_CURRENT_MENU_TAG}'; {len(stale)} would have the tag stripped"
+                f"'{_CURRENT_MENU_TAG}'; {len(stale)} would have the tag stripped "
+                f"and {would_unpublish} would be unpublished from all channels"
             )
             return
 
@@ -757,6 +786,7 @@ class MealsResource(BaseResource):
             f"[reconcile] '{_CURRENT_MENU_TAG}': stripping tag from {len(stale)} "
             f"product(s) no longer in the active menu"
         )
+        pub_gids = await self._get_publication_gids()
         for product in stale:
             dest_id = product["legacyResourceId"]
             title = product.get("title") or dest_id
@@ -774,16 +804,41 @@ class MealsResource(BaseResource):
                     f"[reconcile] meal '{title}': failed to strip "
                     f"'{_CURRENT_MENU_TAG}' (dest_id={dest_id}): {exc}"
                 )
+            # A meal that left the active menu must also leave every sales
+            # channel — stripping the tag alone leaves it published. Independent
+            # of the tag strip (own try/except) so one failure never skips the
+            # other. Idempotent: _diff_publications returns None when the product
+            # is already unpublished everywhere, so no redundant mutation fires.
+            pub_diff = _diff_publications(
+                product.get("publications") or {}, pub_gids, False
+            )
+            if pub_diff:
+                try:
+                    await self._sync_publications_for(
+                        product["id"], pub_diff, title
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[reconcile] meal '{title}': failed to unpublish "
+                        f"(dest_id={dest_id}): {exc}"
+                    )
 
     async def _fetch_products_tagged(self, tag: str) -> list[dict]:
-        """Return all destination products carrying `tag`, following GraphQL
-        cursor pagination. Each entry is {id, legacyResourceId, title, tags}."""
+        """Return all destination products carrying `tag`."""
+        return await self._fetch_products_matching(f"tag:{tag}")
+
+    async def _fetch_products_matching(self, search_query: str) -> list[dict]:
+        """Return all destination products matching a Shopify product search
+        query (e.g. 'tag:current-menu' or 'vendor:Fresheo -tag:current-menu'),
+        following GraphQL cursor pagination. Each entry is
+        {id, legacyResourceId, title, tags, publications}, where `publications`
+        maps publication_gid -> isPublished (used to unpublish stale meals)."""
         results: list[dict] = []
         cursor: Optional[str] = None
         while True:
             data = await self.dest.graphql(
                 _GQL_PRODUCTS_BY_TAG,
-                variables={"query": f"tag:{tag}", "cursor": cursor},
+                variables={"query": search_query, "cursor": cursor},
                 estimated_cost=250,
             )
             conn = data.get("products", {}) or {}
@@ -794,12 +849,71 @@ class MealsResource(BaseResource):
                     "legacyResourceId": str(node.get("legacyResourceId") or ""),
                     "title":            node.get("title") or "",
                     "tags":             list(node.get("tags") or []),
+                    "publications":     _publications_from_node(node),
                 })
             page_info = conn.get("pageInfo", {}) or {}
             if not page_info.get("hasNextPage"):
                 break
             cursor = page_info.get("endCursor")
         return results
+
+    # ── BACKFILL (one-time maintenance) ──────────────────────────────────────
+
+    async def unpublish_inactive_products(self) -> None:
+        """One-time sweep: unpublish meal products that left the active menu
+        before the reconcile pass learned to unpublish.
+
+        Those products already had their `current-menu` tag stripped by an
+        earlier run, so the tag-based reconciliation can no longer see them, yet
+        they stay published on every sales channel. The `current-menu` tag is
+        added on every create/update iff the meal is active today
+        (`django_db._build_tags`), so a meal product *without* the tag is, by
+        definition, not in the active menu — no Django extract or keep-set is
+        needed. Selection: `vendor:Fresheo -tag:current-menu`. Each still-published
+        match is unpublished from all channels via the same idempotent
+        [[_diff_publications]] + [[_sync_publications_for]] path as the reconcile
+        pass; product status is left untouched. Run once with `--dry-run` first.
+        """
+        query = f"vendor:{_MEAL_VENDOR} -tag:{_CURRENT_MENU_TAG}"
+        products = await self._fetch_products_matching(query)
+        pub_gids = await self._get_publication_gids()
+
+        to_unpublish = [
+            p for p in products
+            if _diff_publications(p.get("publications") or {}, pub_gids, False)
+        ]
+
+        if self.dry_run:
+            logger.info(
+                f"[DRY RUN][backfill] {len(products)} meal product(s) match "
+                f"'{query}'; {len(to_unpublish)} are still published and would "
+                f"be unpublished from all channels"
+            )
+            return
+
+        if not to_unpublish:
+            logger.info(
+                f"[backfill] {len(products)} meal product(s) match '{query}'; "
+                f"none are still published — nothing to do"
+            )
+            return
+
+        logger.info(
+            f"[backfill] unpublishing {len(to_unpublish)} inactive meal "
+            f"product(s) from all channels"
+        )
+        for product in to_unpublish:
+            title = product.get("title") or product["legacyResourceId"]
+            pub_diff = _diff_publications(
+                product.get("publications") or {}, pub_gids, False
+            )
+            try:
+                await self._sync_publications_for(product["id"], pub_diff, title)
+            except Exception as exc:
+                logger.warning(
+                    f"[backfill] meal '{title}': failed to unpublish "
+                    f"(dest_id={product['legacyResourceId']}): {exc}"
+                )
 
     # ── EXTRACT ──────────────────────────────────────────────────────────────
 
@@ -821,7 +935,7 @@ class MealsResource(BaseResource):
             "title": title,
             "handle": _slugify(title),
             "body_html": self._renderer.render(item),
-            "vendor": "Fresheo",
+            "vendor": _MEAL_VENDOR,
             "status": "active",
             # `published` controls Online Store auto-publish on create. For
             # inactive meals we set it false so the product isn't briefly
@@ -1091,12 +1205,7 @@ class MealsResource(BaseResource):
                 metafields[full_key] = value
 
         # Per-publication state.
-        publications: dict[str, bool] = {}
-        for e in node.get("resourcePublicationsV2", {}).get("edges", []):
-            pub = e.get("node") or {}
-            pub_gid = (pub.get("publication") or {}).get("id")
-            if pub_gid:
-                publications[pub_gid] = bool(pub.get("isPublished"))
+        publications = _publications_from_node(node)
 
         spg_ids = [
             e["node"]["id"]

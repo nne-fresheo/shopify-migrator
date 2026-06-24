@@ -106,6 +106,17 @@ _DEFAULT_PUBLICATIONS_RESPONSE = {"publications": {"edges": [
 ]}}
 
 
+def _resource_pub_edges(pub1: bool = True, pub2: bool = True) -> dict:
+    """Build a `resourcePublicationsV2` value for a productsByTag node, with the
+    given published state on the two default publications (/1, /2)."""
+    return {"edges": [
+        {"node": {"publication": {"id": "gid://shopify/Publication/1"},
+                  "isPublished": pub1}},
+        {"node": {"publication": {"id": "gid://shopify/Publication/2"},
+                  "isPublished": pub2}},
+    ]}
+
+
 def _existing_node(
     payload: dict | None = None,
     *,
@@ -1452,7 +1463,8 @@ class TestMealsLoad:
         mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
             products_by_tag_edges=[
                 {"id": "gid://shopify/Product/7777", "legacyResourceId": "7777",
-                 "title": "Vieux plat", "tags": ["current-menu", "dessert"]},
+                 "title": "Vieux plat", "tags": ["current-menu", "dessert"],
+                 "resourcePublicationsV2": _resource_pub_edges()},
             ],
         ))
 
@@ -1464,6 +1476,75 @@ class TestMealsLoad:
         await resource.load()
 
         mock_dest_client.put.assert_not_awaited()
+        # Dry run must not unpublish either, even though 7777 is still published.
+        assert not any(
+            "publishableUnpublish" in c.args[0]
+            for c in mock_dest_client.graphql.await_args_list
+        )
+
+    async def test_reconcile_unpublishes_stale_product(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # 7777 left the menu and is still published on both channels. The
+        # reconcile sweep must strip the tag AND unpublish it from every channel.
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.post = AsyncMock(
+            return_value={"product": {"id": 9001, "variants": [], "images": []}}
+        )
+        mock_dest_client.put = AsyncMock(return_value={})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            products_by_tag_edges=[
+                {"id": "gid://shopify/Product/7777", "legacyResourceId": "7777",
+                 "title": "Vieux plat", "tags": ["current-menu", "dessert"],
+                 "resourcePublicationsV2": _resource_pub_edges()},
+            ],
+        ))
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        unpublish_calls = [
+            c for c in mock_dest_client.graphql.await_args_list
+            if "publishableUnpublish" in c.args[0]
+        ]
+        assert len(unpublish_calls) == 1
+        assert unpublish_calls[0].kwargs["variables"]["id"] == "gid://shopify/Product/7777"
+        input_value = unpublish_calls[0].kwargs["variables"]["input"]
+        assert {p["publicationId"] for p in input_value} == {
+            "gid://shopify/Publication/1", "gid://shopify/Publication/2",
+        }
+
+    async def test_reconcile_already_unpublished_stale_emits_no_unpublish(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
+    ):
+        # 7777 is stale but already unpublished everywhere → _diff_publications
+        # returns None, so no redundant unpublish mutation fires.
+        mock_dest_client.get = AsyncMock(return_value={"products": []})
+        mock_dest_client.post = AsyncMock(
+            return_value={"product": {"id": 9001, "variants": [], "images": []}}
+        )
+        mock_dest_client.put = AsyncMock(return_value={})
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            products_by_tag_edges=[
+                {"id": "gid://shopify/Product/7777", "legacyResourceId": "7777",
+                 "title": "Vieux plat", "tags": ["current-menu", "dessert"],
+                 "resourcePublicationsV2": _resource_pub_edges(pub1=False, pub2=False)},
+            ],
+        ))
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        (tmp_data_dir / "meals.json").write_text(json.dumps([sample_meal]))
+        await resource.load()
+
+        assert not any(
+            "publishableUnpublish" in c.args[0]
+            for c in mock_dest_client.graphql.await_args_list
+        )
 
     async def test_create_payload_includes_variants_and_options(
         self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer, sample_meal
@@ -2742,3 +2823,80 @@ class TestMealMetafieldSync:
         assert diet_mf["type"] == "list.metaobject_reference"
         # Only sans-gluten matches; meat is omitted (not a dietary preference).
         assert json.loads(diet_mf["value"]) == ["gid://shopify/Metaobject/21"]
+
+
+class TestUnpublishInactiveProducts:
+    """One-time backfill: unpublish meal products that left the active menu
+    before the reconcile pass learned to unpublish (already untagged, still
+    published). Selection query is `vendor:Fresheo -tag:current-menu`, served
+    by the same productsByTag mock branch."""
+
+    async def test_unpublishes_still_published_match(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+    ):
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            products_by_tag_edges=[
+                {"id": "gid://shopify/Product/7777", "legacyResourceId": "7777",
+                 "title": "Vieux plat", "tags": ["dessert"],
+                 "resourcePublicationsV2": _resource_pub_edges()},
+            ],
+        ))
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        await resource.unpublish_inactive_products()
+
+        unpublish_calls = [
+            c for c in mock_dest_client.graphql.await_args_list
+            if "publishableUnpublish" in c.args[0]
+        ]
+        assert len(unpublish_calls) == 1
+        assert unpublish_calls[0].kwargs["variables"]["id"] == "gid://shopify/Product/7777"
+        input_value = unpublish_calls[0].kwargs["variables"]["input"]
+        assert {p["publicationId"] for p in input_value} == {
+            "gid://shopify/Publication/1", "gid://shopify/Publication/2",
+        }
+
+    async def test_skips_already_unpublished_match(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+    ):
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            products_by_tag_edges=[
+                {"id": "gid://shopify/Product/7777", "legacyResourceId": "7777",
+                 "title": "Vieux plat", "tags": ["dessert"],
+                 "resourcePublicationsV2": _resource_pub_edges(pub1=False, pub2=False)},
+            ],
+        ))
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+        )
+        await resource.unpublish_inactive_products()
+
+        assert not any(
+            "publishableUnpublish" in c.args[0]
+            for c in mock_dest_client.graphql.await_args_list
+        )
+
+    async def test_dry_run_makes_no_unpublish(
+        self, mock_dest_client, tmp_data_dir, progress, failed_log, renderer
+    ):
+        mock_dest_client.graphql = AsyncMock(side_effect=_smart_graphql(
+            products_by_tag_edges=[
+                {"id": "gid://shopify/Product/7777", "legacyResourceId": "7777",
+                 "title": "Vieux plat", "tags": ["dessert"],
+                 "resourcePublicationsV2": _resource_pub_edges()},
+            ],
+        ))
+
+        resource = _make_resource(
+            mock_dest_client, tmp_data_dir, progress, failed_log, renderer,
+            dry_run=True,
+        )
+        await resource.unpublish_inactive_products()
+
+        assert not any(
+            "publishableUnpublish" in c.args[0]
+            for c in mock_dest_client.graphql.await_args_list
+        )

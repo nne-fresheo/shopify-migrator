@@ -31,6 +31,8 @@ from .resources.meals import MealsResource
 from .resources.rewriter import ImageUrlRewriter
 from .resources.selling_plans import SellingPlansResource
 from .resources.variant_id_map_builder import build_variant_id_map
+from .menu_autofill.autofill import MenuAutofiller, write_audit
+from .menu_autofill.loop_client import LoopAdminClient, LoopStorefrontClient
 from .template import DescriptionRenderer
 from .vouchers import (
     VoucherGenerator,
@@ -225,6 +227,19 @@ def sync_meals(dry_run: bool, force: bool, skip_extract: bool) -> None:
     asyncio.run(_run_sync_meals(dry_run, force, skip_extract))
 
 
+@cli.command("unpublish-inactive-meals")
+@click.option("--dry-run", is_flag=True, help="List products that would be unpublished without writing")
+def unpublish_inactive_meals(dry_run: bool) -> None:
+    """One-time backfill: unpublish meal products no longer in the active menu.
+
+    Targets meals that left the menu before the reconcile pass learned to
+    unpublish (they lost their 'current-menu' tag but stayed on all sales
+    channels). Reads from Shopify only — no Django DB needed. Run with
+    --dry-run first to review the count.
+    """
+    asyncio.run(_run_unpublish_inactive_meals(dry_run))
+
+
 @cli.command("generate-vouchers")
 @click.option(
     "--file", "email_file",
@@ -326,6 +341,38 @@ def update_vouchers(
         _run_update_vouchers(
             report_file, amount, days, purchase_type, recurring_cycles,
             usage_limit, once_per_customer, output_file, dry_run,
+        )
+    )
+
+
+@cli.command("autofill-menu")
+@click.option(
+    "--dry-run/--no-dry-run",
+    default=True,
+    help="Plan and report only, without writing bundles (default: dry-run on)",
+)
+@click.option("--target-lead-hours", type=int, default=48, help="Adapt subscriptions anchored within this many hours (default: 48)")
+@click.option("--min-lead-hours", type=int, default=24, help="Never edit inside this lock window before the anchor (default: 24)")
+@click.option("--limit", type=int, default=None, help="Process at most N subscriptions (for ramp/testing)")
+@click.option("--seed", type=int, default=None, help="Seed the random candidate picker for reproducible runs")
+@click.option(
+    "--output", "output_file",
+    type=click.Path(dir_okay=False),
+    default="menu_autofill_audit.csv",
+    help="Audit CSV report path (default: menu_autofill_audit.csv)",
+)
+def autofill_menu(
+    dry_run: bool,
+    target_lead_hours: int,
+    min_lead_hours: int,
+    limit: Optional[int],
+    seed: Optional[int],
+    output_file: str,
+) -> None:
+    """Swap stale meals in upcoming Loop bundle subscriptions for in-menu ones."""
+    asyncio.run(
+        _run_autofill_menu(
+            dry_run, target_lead_hours, min_lead_hours, limit, seed, output_file
         )
     )
 
@@ -538,6 +585,38 @@ async def _run_sync_meals(dry_run: bool, force: bool, skip_extract: bool) -> Non
         await resource.load(force=force)
 
 
+async def _run_unpublish_inactive_meals(dry_run: bool) -> None:
+    cfg = load_config()
+    setup_logging(cfg.migration_log_file, cfg.log_level)
+
+    if dry_run:
+        console.print("[bold yellow]DRY RUN MODE — no writes will be made to destination[/]")
+
+    async with _make_client(
+        cfg, cfg.dest_shop, cfg.dest_token, cfg.dest_client_id, cfg.dest_client_secret
+    ) as dest:
+        registry = IDMapRegistry(cfg.id_maps_dir)
+        progress = ProgressTracker(cfg.progress_file)
+        failed_log = FailedResourcesLog(cfg.failed_resources_file)
+
+        resource = MealsResource(
+            source_client=None,
+            dest_client=dest,
+            data_dir=cfg.data_dir,
+            id_map=registry.get("meals"),
+            progress=progress,
+            failed_log=failed_log,
+            dry_run=dry_run,
+            renderer=DescriptionRenderer(cfg.description_template),
+            django_dsn=cfg.django_database_url,
+            django_media_url=cfg.django_media_url,
+            locale=cfg.meal_locale,
+            subscription_group_code=cfg.subscription_group_code,
+        )
+
+        await resource.unpublish_inactive_products()
+
+
 async def _run_generate_vouchers(
     email_file: str,
     amount: float,
@@ -689,6 +768,80 @@ async def _run_update_vouchers(
     failed = counts.get("failed", 0)
     if failed:
         console.print(f"[red]{failed} voucher(s) failed — see the report for details.[/]")
+
+
+async def _run_autofill_menu(
+    dry_run: bool,
+    target_lead_hours: int,
+    min_lead_hours: int,
+    limit: Optional[int],
+    seed: Optional[int],
+    output_file: str,
+) -> None:
+    import random
+
+    cfg = load_config()
+    setup_logging(cfg.migration_log_file, cfg.log_level)
+
+    if not cfg.loop_admin_token:
+        raise click.ClickException(
+            "LOOP_ADMIN_TOKEN is not set. Add it to .env (scopes: read subscription "
+            "contracts, read & write customers)."
+        )
+
+    if dry_run:
+        console.print("[bold yellow]DRY RUN MODE — no bundles will be written[/]")
+
+    rng = random.Random(seed)
+    admin = LoopAdminClient(
+        cfg.loop_admin_token,
+        base_url=cfg.loop_api_base_url,
+        api_version=cfg.loop_api_version,
+        max_retries=cfg.max_retries,
+    )
+    storefront = LoopStorefrontClient(
+        admin,
+        base_url=cfg.loop_api_base_url,
+        api_version=cfg.loop_api_version,
+        max_retries=cfg.max_retries,
+    )
+
+    async with (
+        _make_client(cfg, cfg.dest_shop, cfg.dest_token, cfg.dest_client_id, cfg.dest_client_secret) as dest,
+        admin,
+        storefront,
+    ):
+        autofiller = MenuAutofiller(
+            shopify=dest,
+            admin=admin,
+            storefront=storefront,
+            active_menu_tag=cfg.active_menu_tag,
+            target_lead_hours=target_lead_hours,
+            min_lead_hours=min_lead_hours,
+            dry_run=dry_run,
+            rng=rng,
+        )
+        rows = await autofiller.run(limit=limit)
+
+    write_audit(rows, Path(output_file))
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.decision or "?"] = counts.get(row.decision or "?", 0) + 1
+
+    table = Table(title="Menu Auto-Fill Summary", show_lines=True)
+    table.add_column("Decision", style="cyan")
+    table.add_column("Count", justify="right")
+    for decision_name in ("skip", "adapt", "flag", "locked", "no_bundle", "error"):
+        if decision_name in counts:
+            style = "red" if decision_name in ("flag", "error") else "green"
+            table.add_row(f"[{style}]{decision_name}[/]", str(counts[decision_name]))
+    console.print(table)
+    console.print(f"Audit report written to [cyan]{output_file}[/]")
+
+    failed = sum(1 for r in rows if not r.ok)
+    if failed:
+        console.print(f"[red]{failed} subscription(s) need attention — see the audit report.[/]")
 
 
 if __name__ == "__main__":

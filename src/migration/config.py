@@ -45,6 +45,11 @@ class Config:
     django_media_url: str
     meal_locale: str
     subscription_group_code: str
+    # Loop weekly-menu auto-fill (see menu_autofill package)
+    loop_admin_token: str
+    loop_api_base_url: str
+    loop_api_version: str
+    active_menu_tag: str
 
     @property
     def id_maps_dir(self) -> Path:
@@ -102,4 +107,8 @@ def load_config() -> Config:
         django_media_url=_optional("DJANGO_MEDIA_URL", ""),
         meal_locale=_optional("MEAL_LOCALE", "fr"),
         subscription_group_code=_optional("SHOPIFY_SUBSCRIPTION_GROUP_CODE", "main-bundle"),
+        loop_admin_token=_optional("LOOP_ADMIN_TOKEN", ""),
+        loop_api_base_url=_optional("LOOP_API_BASE_URL", "https://api.loopsubscriptions.com"),
+        loop_api_version=_optional("LOOP_API_VERSION", "2023-10"),
+        active_menu_tag=_optional("ACTIVE_MENU_TAG", "current-menu"),
     )

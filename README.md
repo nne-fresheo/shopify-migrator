@@ -159,6 +159,27 @@ After files and content (pages, articles) are fully loaded, run this to replace 
 uv run main.py rewrite-images
 ```
 
+### Weekly menu auto-fill for Loop subscriptions
+
+Each week the active menu rotates (Shopify products tagged `current-menu`). Subscribers who don't re-pick their meals would have stale, out-of-menu dishes in their next box. Run this **daily** to swap each stale meal in a subscription's next upcoming Loop bundle for an active meal of the **same category** (the bare category tag — `main-dish`, `dessert`, …) and **same quantity**:
+
+```bash
+# Dry run (default): plan + write menu_autofill_audit.csv, no bundle writes
+uv run main.py autofill-menu
+
+# Live (requires the Loop Storefront Bundle beta enabled on the account)
+uv run main.py autofill-menu --no-dry-run --seed 7
+```
+
+Behavior:
+
+- A bundle whose meals are all in-menu is **skipped**; idempotent, safe to re-run daily.
+- A stale meal with no same-category replacement **flags the whole subscription** for manual review and is **not written** (no cross-category fallback).
+- Subscriptions inside `--min-lead-hours` (default 24) of their anchor are **locked** and never edited; `--target-lead-hours` (default 48) bounds discovery.
+- Every subscription produces an audit row (decision, removed/added variants, category mapping) in the `--output` CSV.
+
+Requires `LOOP_ADMIN_TOKEN` (and the Loop beta for the write path) — see `.env.example`. The read-only dry run uses only the Shopify and Loop Admin APIs.
+
 ---
 
 ## Resumability
